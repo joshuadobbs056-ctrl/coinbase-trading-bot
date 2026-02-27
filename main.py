@@ -43,26 +43,46 @@ SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "160"))
 # =========================
 
 def send(msg):
+    print(f"[TELEGRAM] {msg}", flush=True)
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        }, timeout=10)
-    except:
-        pass
+
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg
+            },
+            timeout=10
+        )
+
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}", flush=True)
 
 # =========================
 # STATE
 # =========================
 
 def load_state():
+
     try:
         if os.path.exists(STATE_FILE):
+
             with open(STATE_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
+                state = json.load(f)
+
+                print("[STATE] Loaded existing state", flush=True)
+
+                return state
+
+    except Exception as e:
+        print(f"[STATE LOAD ERROR] {e}", flush=True)
+
+    print("[STATE] Creating new state", flush=True)
 
     return {
         "cash": START_BALANCE,
@@ -71,39 +91,64 @@ def load_state():
     }
 
 def save_state(state):
+
     try:
+
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+
         tmp = STATE_FILE + ".tmp"
+
         with open(tmp, "w") as f:
             json.dump(state, f)
+
         os.replace(tmp, STATE_FILE)
-    except:
-        pass
+
+    except Exception as e:
+        print(f"[STATE SAVE ERROR] {e}", flush=True)
 
 # =========================
 # MARKET DATA
 # =========================
 
 def get_products():
+
     try:
-        r = requests.get("https://api.exchange.coinbase.com/products", timeout=10)
+
+        r = requests.get(
+            "https://api.exchange.coinbase.com/products",
+            timeout=10
+        )
+
         data = r.json()
 
         usd_pairs = [
+
             p["id"]
+
             for p in data
+
             if ("USD" in p["id"] or "USDC" in p["id"])
             and p.get("status") == "online"
+
         ]
 
-        return random.sample(usd_pairs, min(len(usd_pairs), UNIVERSE_SIZE))
+        return random.sample(
+            usd_pairs,
+            min(len(usd_pairs), UNIVERSE_SIZE)
+        )
 
-    except:
+    except Exception as e:
+
+        print(f"[PRODUCT ERROR] {e}", flush=True)
+
         return []
 
 def get_price(product):
+
     try:
+
         url = f"https://api.exchange.coinbase.com/products/{product}/ticker"
+
         r = requests.get(url, timeout=10)
 
         if r.status_code != 200:
@@ -111,16 +156,13 @@ def get_price(product):
 
         data = r.json()
 
-        if "price" not in data:
-            return None
-
         return float(data["price"])
 
     except:
         return None
 
 # =========================
-# TREND DETECTION (SNIPER)
+# TREND DETECTION
 # =========================
 
 def get_trend_score(product):
@@ -128,6 +170,7 @@ def get_trend_score(product):
     try:
 
         url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=300"
+
         r = requests.get(url, timeout=10)
 
         if r.status_code != 200:
@@ -163,7 +206,29 @@ def get_trend_score(product):
         return score
 
     except:
+
         return None
+
+# =========================
+# EQUITY
+# =========================
+
+def calculate_equity(state):
+
+    total = state["cash"]
+
+    for product, pos in state["positions"].items():
+
+        price = get_price(product)
+
+        if price is None:
+            continue
+
+        total += pos["size"] * price
+
+    state["equity"] = total
+
+    return total
 
 # =========================
 # POSITION MANAGEMENT
@@ -200,17 +265,17 @@ def open_position(state, product):
     state["cash"] -= spend
 
     state["positions"][product] = {
+
         "entry": price,
         "size": size,
         "time": time.time()
+
     }
 
     send(
-        f"PAPER BUY — {product}\n"
-        f"Entry: ${price:.5f}\n"
-        f"Spend: ${spend:.2f}\n"
-        f"Equity: ${calculate_equity(state):.2f}\n"
-        f"Open: {len(state['positions'])}/{MAX_OPEN_POSITIONS}"
+        f"BUY {product} @ ${price:.5f} | "
+        f"Spend: ${spend:.2f} | "
+        f"Equity: ${calculate_equity(state):.2f}"
     )
 
 def close_position(state, product, price):
@@ -219,16 +284,15 @@ def close_position(state, product, price):
 
     value = pos["size"] * price
 
-    state["cash"] += value
-
     pnl = value - (pos["size"] * pos["entry"])
+
+    state["cash"] += value
 
     del state["positions"][product]
 
     send(
-        f"SELL — {product}\n"
-        f"Exit: ${price:.5f}\n"
-        f"P/L: ${pnl:.2f}\n"
+        f"SELL {product} @ ${price:.5f} | "
+        f"P/L: ${pnl:.2f} | "
         f"Equity: ${calculate_equity(state):.2f}"
     )
 
@@ -246,28 +310,8 @@ def manage_positions(state):
         change = (price - pos["entry"]) / pos["entry"]
 
         if change >= TAKE_PROFIT_PCT or change <= -STOP_LOSS_PCT:
+
             close_position(state, product, price)
-
-# =========================
-# EQUITY
-# =========================
-
-def calculate_equity(state):
-
-    total = state["cash"]
-
-    for product, pos in state["positions"].items():
-
-        price = get_price(product)
-
-        if price is None:
-            continue
-
-        total += pos["size"] * price
-
-    state["equity"] = total
-
-    return total
 
 # =========================
 # SCANNER
@@ -278,9 +322,13 @@ def scanner(state):
     products = get_products()
 
     if not products:
+        print("[SCAN] No products", flush=True)
         return
 
-    sample = random.sample(products, min(len(products), SAMPLE_SIZE))
+    sample = random.sample(
+        products,
+        min(len(products), SAMPLE_SIZE)
+    )
 
     for product in sample:
 
@@ -288,6 +336,8 @@ def scanner(state):
 
         if score is None:
             continue
+
+        print(f"[SIGNAL] {product} score={score:.2f}", flush=True)
 
         open_position(state, product)
 
@@ -297,19 +347,27 @@ def scanner(state):
 
 def main():
 
+    print("[BOT] Starting sniper bot...", flush=True)
+
     state = load_state()
 
     send(
-        f"SCALPER SNIPER STARTED\n"
+        f"BOT STARTED\n"
         f"Mode: {TRADE_MODE}\n"
-        f"Cash: ${state['cash']:.2f}\n"
-        f"Max open: {MAX_OPEN_POSITIONS}\n"
-        f"TP/SL: {TAKE_PROFIT_PCT*100:.2f}% / {STOP_LOSS_PCT*100:.2f}%"
+        f"Cash: ${state['cash']:.2f}"
     )
 
     while True:
 
         try:
+
+            print(
+                f"[LOOP] {datetime.now()} | "
+                f"Equity=${state['equity']:.2f} | "
+                f"Cash=${state['cash']:.2f} | "
+                f"Positions={len(state['positions'])}",
+                flush=True
+            )
 
             manage_positions(state)
 
@@ -323,7 +381,9 @@ def main():
 
         except Exception as e:
 
-            send(f"Error: {str(e)}")
+            print(f"[ERROR] {e}", flush=True)
+
+            send(f"ERROR: {e}")
 
             time.sleep(10)
 
