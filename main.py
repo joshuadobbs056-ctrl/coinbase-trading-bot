@@ -5,7 +5,7 @@ import random
 import requests
 
 # ============================================
-# ENV VARIABLES
+# CONFIG
 # ============================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -15,24 +15,31 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
+SAVAGE_MODE = os.getenv("SAVAGE_MODE", "0") == "1"
+
+# Normal mode
+BASE_RISK = 0.03
+
+# Savage mode increases risk dynamically
+SAVAGE_RISK = 0.06
 
 MIN_SPEND = float(os.getenv("MIN_SPEND", "25"))
-MAX_SPEND = float(os.getenv("MAX_SPEND", "100"))
+MAX_SPEND = float(os.getenv("MAX_SPEND", "300"))
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
+MAX_OPEN_POSITIONS = 20 if SAVAGE_MODE else 12
 
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.02"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.015"))
+STOP_LOSS_PCT = 0.02 if SAVAGE_MODE else 0.015
 
-TRAILING_ACTIVATION = float(os.getenv("TRAILING_ACTIVATION", "0.02"))
-TRAILING_DISTANCE = float(os.getenv("TRAILING_DISTANCE", "0.006"))
+TRAILING_ACTIVATION = 0.015 if SAVAGE_MODE else 0.02
+TRAILING_DISTANCE = 0.005 if SAVAGE_MODE else 0.006
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
+SCAN_INTERVAL = 6 if SAVAGE_MODE else 12
 
-HEARTBEAT_INTERVAL = 300
+COOLDOWN_SECONDS = 600 if SAVAGE_MODE else 1800
 
-MIN_TREND_PCT = float(os.getenv("MIN_TREND_PCT_30M", "0.009"))
+MIN_TREND = 0.012 if SAVAGE_MODE else 0.015
+MAX_SPREAD = 0.004 if SAVAGE_MODE else 0.0035
+MIN_VOLUME_USD = 250000 if SAVAGE_MODE else 500000
 
 # ============================================
 # TELEGRAM
@@ -40,27 +47,16 @@ MIN_TREND_PCT = float(os.getenv("MIN_TREND_PCT_30M", "0.009"))
 
 def send(msg):
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
     try:
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-        r = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg
-            },
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
         )
 
-        print("[TELEGRAM]", r.text)
-
-    except Exception as e:
-
-        print("Telegram error:", e)
+    except:
+        pass
 
 # ============================================
 # STATE
@@ -69,37 +65,24 @@ def send(msg):
 def load_state():
 
     try:
-
-        if os.path.exists(STATE_FILE):
-
-            with open(STATE_FILE, "r") as f:
-
-                return json.load(f)
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
 
     except:
-        pass
 
-    return {
-
-        "cash": START_BALANCE,
-        "positions": {},
-        "start_balance": START_BALANCE,
-        "last_heartbeat": 0
-
-    }
+        return {
+            "cash": START_BALANCE,
+            "positions": {},
+            "cooldowns": {},
+            "start_balance": START_BALANCE
+        }
 
 def save_state(state):
 
-    try:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-
-        with open(STATE_FILE, "w") as f:
-
-            json.dump(state, f)
-
-    except:
-        pass
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 # ============================================
 # MARKET DATA
@@ -114,19 +97,14 @@ def get_products():
             timeout=10
         )
 
-        data = r.json()
-
         pairs = [
-
             p["id"]
-
-            for p in data
-
-            if ("USD" in p["id"]) and p["status"] == "online"
-
+            for p in r.json()
+            if p["status"] == "online"
+            and p["quote_currency"] == "USD"
         ]
 
-        return random.sample(pairs, min(len(pairs), 200))
+        return random.sample(pairs, min(len(pairs), 150))
 
     except:
 
@@ -147,41 +125,124 @@ def get_price(product):
 
         return None
 
+def get_spread(product):
+
+    try:
+
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/book?level=1",
+            timeout=10
+        )
+
+        data = r.json()
+
+        bid = float(data["bids"][0][0])
+        ask = float(data["asks"][0][0])
+
+        return (ask - bid) / bid
+
+    except:
+
+        return 999
+
+def get_volume(product):
+
+    try:
+
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/stats",
+            timeout=10
+        )
+
+        stats = r.json()
+
+        return float(stats["volume"]) * float(stats["last"])
+
+    except:
+
+        return 0
+
+def get_trend(product):
+
+    try:
+
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=300",
+            timeout=10
+        )
+
+        candles = r.json()
+
+        closes = [c[4] for c in candles[:12]]
+
+        return (closes[0] - closes[-1]) / closes[-1]
+
+    except:
+
+        return 0
+
 # ============================================
 # EQUITY
 # ============================================
 
-def calculate_equity(state):
+def equity(state):
 
     total = state["cash"]
 
-    for product, pos in state["positions"].items():
+    for p, pos in state["positions"].items():
 
-        price = get_price(product)
+        price = get_price(p)
 
         if price:
-
             total += pos["size"] * price
 
     return total
 
 # ============================================
-# POSITION SIZE
+# RISK
 # ============================================
 
-def calculate_spend(state):
+def risk_percent(state):
 
-    equity = calculate_equity(state)
+    eq = equity(state)
 
-    spend = equity * RISK_PER_TRADE
+    if SAVAGE_MODE:
 
-    spend = max(spend, MIN_SPEND)
-    spend = min(spend, MAX_SPEND)
+        if eq > 5000:
+            return 0.10
 
-    return spend
+        if eq > 2000:
+            return 0.08
+
+        return SAVAGE_RISK
+
+    return BASE_RISK
 
 # ============================================
-# OPEN POSITION
+# ENTRY FILTER
+# ============================================
+
+def elite_entry(state, product):
+
+    now = time.time()
+
+    if product in state["cooldowns"]:
+        if now < state["cooldowns"][product]:
+            return False
+
+    if get_spread(product) > MAX_SPREAD:
+        return False
+
+    if get_volume(product) < MIN_VOLUME_USD:
+        return False
+
+    if get_trend(product) < MIN_TREND:
+        return False
+
+    return True
+
+# ============================================
+# POSITION MANAGEMENT
 # ============================================
 
 def open_position(state, product):
@@ -192,12 +253,18 @@ def open_position(state, product):
     if len(state["positions"]) >= MAX_OPEN_POSITIONS:
         return
 
+    if not elite_entry(state, product):
+        return
+
     price = get_price(product)
 
     if not price:
         return
 
-    spend = calculate_spend(state)
+    spend = equity(state) * risk_percent(state)
+
+    spend = max(spend, MIN_SPEND)
+    spend = min(spend, MAX_SPEND)
 
     if state["cash"] < spend:
         return
@@ -207,27 +274,13 @@ def open_position(state, product):
     state["cash"] -= spend
 
     state["positions"][product] = {
-
         "entry": price,
         "size": size,
         "highest": price,
-        "trailing_active": False
-
+        "trailing": False
     }
 
-    equity = calculate_equity(state)
-    profit = equity - state["start_balance"]
-
-    send(
-        f"BUY {product}\n"
-        f"Price ${price:.5f}\n"
-        f"Balance ${equity:.2f}\n"
-        f"Profit ${profit:.2f}"
-    )
-
-# ============================================
-# CLOSE POSITION
-# ============================================
+    send(f"SAVAGE BUY {product} @ {price}")
 
 def close_position(state, product, price, reason):
 
@@ -235,36 +288,21 @@ def close_position(state, product, price, reason):
 
     value = pos["size"] * price
 
-    state["cash"] += value
-
     pnl = value - (pos["entry"] * pos["size"])
+
+    state["cash"] += value
 
     del state["positions"][product]
 
-    equity = calculate_equity(state)
-    profit = equity - state["start_balance"]
+    state["cooldowns"][product] = time.time() + COOLDOWN_SECONDS
 
-    send(
-        f"SELL {product}\n"
-        f"Price ${price:.5f}\n"
-        f"P/L ${pnl:.2f}\n"
-        f"Balance ${equity:.2f}\n"
-        f"Profit ${profit:.2f}\n"
-        f"{reason}"
-    )
-
-# ============================================
-# MANAGE POSITIONS
-# ============================================
+    send(f"SAVAGE SELL {product} {reason} PnL ${pnl:.2f}")
 
 def manage_positions(state):
 
     for product in list(state["positions"].keys()):
 
         price = get_price(product)
-
-        if not price:
-            continue
 
         pos = state["positions"][product]
 
@@ -273,77 +311,24 @@ def manage_positions(state):
         change = (price - entry) / entry
 
         if price > pos["highest"]:
-
             pos["highest"] = price
 
         if change >= TRAILING_ACTIVATION:
+            pos["trailing"] = True
 
-            pos["trailing_active"] = True
+        if pos["trailing"]:
 
-        if pos["trailing_active"]:
+            stop = pos["highest"] * (1 - TRAILING_DISTANCE)
 
-            trail_stop = pos["highest"] * (1 - TRAILING_DISTANCE)
+            if price <= stop:
 
-            if price <= trail_stop:
-
-                close_position(state, product, price, "TRAIL STOP")
+                close_position(state, product, price, "TRAIL")
 
                 continue
 
-        if change >= TAKE_PROFIT_PCT:
-
-            close_position(state, product, price, "TAKE PROFIT")
-
-            continue
-
         if change <= -STOP_LOSS_PCT:
 
-            close_position(state, product, price, "STOP LOSS")
-
-# ============================================
-# SCANNER
-# ============================================
-
-def scanner(state):
-
-    products = get_products()
-
-    for product in products:
-
-        price = get_price(product)
-
-        if not price:
-            continue
-
-        score = random.random()
-
-        if score > 0.995:
-
-            open_position(state, product)
-
-# ============================================
-# HEARTBEAT
-# ============================================
-
-def heartbeat(state):
-
-    now = time.time()
-
-    if now - state["last_heartbeat"] < HEARTBEAT_INTERVAL:
-        return
-
-    state["last_heartbeat"] = now
-
-    equity = calculate_equity(state)
-
-    profit = equity - state["start_balance"]
-
-    send(
-        f"STATUS\n"
-        f"Balance ${equity:.2f}\n"
-        f"Profit ${profit:.2f}\n"
-        f"Open trades {len(state['positions'])}"
-    )
+            close_position(state, product, price, "STOP")
 
 # ============================================
 # MAIN LOOP
@@ -353,7 +338,7 @@ def main():
 
     state = load_state()
 
-    send("BOT STARTED")
+    send("SAVAGE MODE ACTIVE" if SAVAGE_MODE else "ELITE MODE ACTIVE")
 
     while True:
 
@@ -361,22 +346,21 @@ def main():
 
             manage_positions(state)
 
-            scanner(state)
+            for product in get_products():
 
-            heartbeat(state)
+                open_position(state, product)
 
             save_state(state)
+
+            print("Equity:", equity(state))
 
             time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
 
-            print("Error:", e)
+            print(e)
 
-            time.sleep(10)
-
-# ============================================
+            time.sleep(5)
 
 if __name__ == "__main__":
-
     main()
