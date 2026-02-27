@@ -3,9 +3,10 @@ import time
 import json
 import requests
 import statistics
+import sys
 
 # =========================
-# ENV CONFIG
+# CONFIG
 # =========================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,12 +18,14 @@ START_BALANCE = float(os.getenv("PAPER_START_BALANCE", 1000))
 TRADE_SIZE = float(os.getenv("QUOTE_PER_TRADE_USD", 25))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 1))
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", 300))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", 60))
 
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", 1.6))
 STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", -0.9))
 
 FEE = float(os.getenv("PAPER_FEE_PCT", 0.004))
+
+print("BOOT: Starting bot...", flush=True)
 
 # =========================
 # TELEGRAM
@@ -33,16 +36,20 @@ def telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=10)
-    except:
-        pass
+
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML"
+            },
+            timeout=10
+        )
+
+    except Exception as e:
+        print("Telegram error:", e, flush=True)
 
 # =========================
 # STATE
@@ -50,16 +57,18 @@ def telegram(msg):
 
 def ensure_dir():
 
-    d = os.path.dirname(STATE_FILE)
+    directory = os.path.dirname(STATE_FILE)
 
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
 
 def load_state():
 
     ensure_dir()
 
     if not os.path.exists(STATE_FILE):
+
+        print("BOOT: Creating new state", flush=True)
 
         return {
             "cash": START_BALANCE,
@@ -69,10 +78,14 @@ def load_state():
 
     try:
 
+        print("BOOT: Loading state", flush=True)
+
         with open(STATE_FILE, "r") as f:
             return json.load(f)
 
-    except:
+    except Exception as e:
+
+        print("State load error:", e, flush=True)
 
         return {
             "cash": START_BALANCE,
@@ -92,23 +105,34 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 # =========================
-# COINBASE DATA
+# COINBASE
 # =========================
 
 def get_products():
 
+    print("SCAN: Fetching products...", flush=True)
+
     try:
 
-        r = requests.get("https://api.exchange.coinbase.com/products", timeout=10)
+        r = requests.get(
+            "https://api.exchange.coinbase.com/products",
+            timeout=10
+        )
 
-        return [
+        products = [
             p["id"]
             for p in r.json()
             if p["quote_currency"] == "USD"
             and p["status"] == "online"
         ]
 
-    except:
+        print(f"SCAN: Found {len(products)} products", flush=True)
+
+        return products
+
+    except Exception as e:
+
+        print("Product fetch error:", e, flush=True)
 
         return []
 
@@ -124,11 +148,10 @@ def get_price(product):
         return float(r.json()["price"])
 
     except:
-
         return None
 
 # =========================
-# SCORING
+# HISTORY
 # =========================
 
 history = {}
@@ -168,6 +191,8 @@ def score(product):
 
 def buy(state, product, price):
 
+    print(f"TRADE: Buying {product}", flush=True)
+
     if product in state["positions"]:
         return
 
@@ -178,9 +203,7 @@ def buy(state, product, price):
         return
 
     cost = TRADE_SIZE
-
     fee = cost * FEE
-
     size = (cost - fee) / price
 
     state["cash"] -= cost
@@ -192,39 +215,28 @@ def buy(state, product, price):
 
     save_state(state)
 
-    telegram(
-        f"<b>PAPER BUY</b>\n"
-        f"{product}\n"
-        f"Price: ${price:.4f}\n"
-        f"Cash: ${state['cash']:.2f}"
-    )
+    telegram(f"PAPER BUY {product} @ ${price:.4f}")
 
 def sell(state, product, price):
+
+    print(f"TRADE: Selling {product}", flush=True)
 
     pos = state["positions"][product]
 
     value = pos["size"] * price
-
     fee = value * FEE
-
     entry_value = pos["size"] * pos["entry"]
 
     pnl = value - fee - entry_value
 
     state["cash"] += value - fee
-
     state["profit"] += pnl
 
     del state["positions"][product]
 
     save_state(state)
 
-    telegram(
-        f"<b>PAPER SELL</b>\n"
-        f"{product}\n"
-        f"PnL: ${pnl:.2f}\n"
-        f"Cash: ${state['cash']:.2f}"
-    )
+    telegram(f"PAPER SELL {product} PnL ${pnl:.2f}")
 
 def manage(state):
 
@@ -244,56 +256,53 @@ def manage(state):
             sell(state, product, price)
 
 # =========================
-# FIND TRADE
-# =========================
-
-def find_trade(state, products):
-
-    best = None
-
-    best_score = 0
-
-    for p in products:
-
-        price = get_price(p)
-
-        if not price:
-            continue
-
-        update_history(p, price)
-
-        s = score(p)
-
-        if s > best_score:
-
-            best_score = s
-
-            best = (p, price)
-
-    if best and best_score > 0:
-
-        buy(state, best[0], best[1])
-
-# =========================
-# MAIN LOOP
+# MAIN
 # =========================
 
 def main():
 
     state = load_state()
 
-    telegram(
-        f"<b>ACTIVE BOT STARTED</b>\n"
-        f"Cash: ${state['cash']:.2f}"
-    )
+    telegram("BOT STARTED")
 
     products = get_products()
 
+    if not products:
+
+        print("ERROR: No products found", flush=True)
+
+        return
+
+    print("BOT: Entering main loop", flush=True)
+
     while True:
+
+        print("SCAN: Running scan cycle...", flush=True)
 
         manage(state)
 
-        find_trade(state, products)
+        best = None
+        best_score = 0
+
+        for p in products:
+
+            price = get_price(p)
+
+            if not price:
+                continue
+
+            update_history(p, price)
+
+            s = score(p)
+
+            if s > best_score:
+
+                best_score = s
+                best = (p, price)
+
+        if best:
+
+            buy(state, best[0], best[1])
 
         time.sleep(SCAN_INTERVAL)
 
