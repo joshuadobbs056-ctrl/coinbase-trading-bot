@@ -5,7 +5,7 @@ import random
 import requests
 
 # ============================================
-# CONFIG
+# ENV CONFIG
 # ============================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,10 +17,11 @@ START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 
 SAVAGE_MODE = os.getenv("SAVAGE_MODE", "0") == "1"
 
-# Normal mode
-BASE_RISK = 0.03
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "120"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "6" if SAVAGE_MODE else "12"))
 
-# Savage mode increases risk dynamically
+# Risk settings
+BASE_RISK = 0.03
 SAVAGE_RISK = 0.06
 
 MIN_SPEND = float(os.getenv("MIN_SPEND", "25"))
@@ -29,14 +30,12 @@ MAX_SPEND = float(os.getenv("MAX_SPEND", "300"))
 MAX_OPEN_POSITIONS = 20 if SAVAGE_MODE else 12
 
 STOP_LOSS_PCT = 0.02 if SAVAGE_MODE else 0.015
-
 TRAILING_ACTIVATION = 0.015 if SAVAGE_MODE else 0.02
 TRAILING_DISTANCE = 0.005 if SAVAGE_MODE else 0.006
 
-SCAN_INTERVAL = 6 if SAVAGE_MODE else 12
-
 COOLDOWN_SECONDS = 600 if SAVAGE_MODE else 1800
 
+# Elite filters
 MIN_TREND = 0.012 if SAVAGE_MODE else 0.015
 MAX_SPREAD = 0.004 if SAVAGE_MODE else 0.0035
 MIN_VOLUME_USD = 250000 if SAVAGE_MODE else 500000
@@ -47,34 +46,44 @@ MIN_VOLUME_USD = 250000 if SAVAGE_MODE else 500000
 
 def send(msg):
 
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
     try:
 
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg
+            },
             timeout=10
         )
 
-    except:
-        pass
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ============================================
-# STATE
+# STATE MANAGEMENT
 # ============================================
 
 def load_state():
 
     try:
+
         with open(STATE_FILE, "r") as f:
+
             return json.load(f)
 
     except:
 
         return {
+
             "cash": START_BALANCE,
             "positions": {},
             "cooldowns": {},
             "start_balance": START_BALANCE
+
         }
 
 def save_state(state):
@@ -82,6 +91,7 @@ def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
     with open(STATE_FILE, "w") as f:
+
         json.dump(state, f)
 
 # ============================================
@@ -98,10 +108,14 @@ def get_products():
         )
 
         pairs = [
+
             p["id"]
+
             for p in r.json()
+
             if p["status"] == "online"
             and p["quote_currency"] == "USD"
+
         ]
 
         return random.sample(pairs, min(len(pairs), 150))
@@ -182,24 +196,25 @@ def get_trend(product):
         return 0
 
 # ============================================
-# EQUITY
+# EQUITY CALCULATION
 # ============================================
 
 def equity(state):
 
     total = state["cash"]
 
-    for p, pos in state["positions"].items():
+    for product, pos in state["positions"].items():
 
-        price = get_price(p)
+        price = get_price(product)
 
         if price:
+
             total += pos["size"] * price
 
     return total
 
 # ============================================
-# RISK
+# RISK CALCULATION
 # ============================================
 
 def risk_percent(state):
@@ -227,6 +242,7 @@ def elite_entry(state, product):
     now = time.time()
 
     if product in state["cooldowns"]:
+
         if now < state["cooldowns"][product]:
             return False
 
@@ -242,7 +258,7 @@ def elite_entry(state, product):
     return True
 
 # ============================================
-# POSITION MANAGEMENT
+# POSITION OPEN
 # ============================================
 
 def open_position(state, product):
@@ -274,13 +290,27 @@ def open_position(state, product):
     state["cash"] -= spend
 
     state["positions"][product] = {
+
         "entry": price,
         "size": size,
         "highest": price,
         "trailing": False
+
     }
 
-    send(f"SAVAGE BUY {product} @ {price}")
+    eq = equity(state)
+    profit = eq - state["start_balance"]
+
+    send(
+        f"BUY {product}\n"
+        f"Price ${price:.5f}\n"
+        f"Balance ${eq:.2f}\n"
+        f"Profit ${profit:.2f}"
+    )
+
+# ============================================
+# POSITION CLOSE
+# ============================================
 
 def close_position(state, product, price, reason):
 
@@ -296,13 +326,28 @@ def close_position(state, product, price, reason):
 
     state["cooldowns"][product] = time.time() + COOLDOWN_SECONDS
 
-    send(f"SAVAGE SELL {product} {reason} PnL ${pnl:.2f}")
+    eq = equity(state)
+    profit = eq - state["start_balance"]
+
+    send(
+        f"SELL {product} ({reason})\n"
+        f"P/L ${pnl:.2f}\n"
+        f"Balance ${eq:.2f}\n"
+        f"Profit ${profit:.2f}"
+    )
+
+# ============================================
+# MANAGE POSITIONS
+# ============================================
 
 def manage_positions(state):
 
     for product in list(state["positions"].keys()):
 
         price = get_price(product)
+
+        if not price:
+            continue
 
         pos = state["positions"][product]
 
@@ -340,9 +385,13 @@ def main():
 
     send("SAVAGE MODE ACTIVE" if SAVAGE_MODE else "ELITE MODE ACTIVE")
 
+    last_status = 0
+
     while True:
 
         try:
+
+            now = time.time()
 
             manage_positions(state)
 
@@ -350,17 +399,32 @@ def main():
 
                 open_position(state, product)
 
-            save_state(state)
+            if now - last_status >= STATUS_INTERVAL:
 
-            print("Equity:", equity(state))
+                eq = equity(state)
+                profit = eq - state["start_balance"]
+
+                send(
+                    f"STATUS\n"
+                    f"Balance ${eq:.2f}\n"
+                    f"Profit ${profit:.2f}\n"
+                    f"Open trades {len(state['positions'])}"
+                )
+
+                last_status = now
+
+            save_state(state)
 
             time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
 
-            print(e)
+            print("Error:", e)
 
             time.sleep(5)
 
+# ============================================
+
 if __name__ == "__main__":
+
     main()
