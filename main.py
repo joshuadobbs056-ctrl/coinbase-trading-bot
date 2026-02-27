@@ -43,22 +43,34 @@ MAX_PORTFOLIO_EXPOSURE = 0.85
 
 def send(msg):
 
-    print(f"[TELEGRAM] {msg}", flush=True)
+    print(f"[TELEGRAM SEND ATTEMPT] {msg}", flush=True)
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN:
+        print("[TELEGRAM ERROR] Missing TELEGRAM_TOKEN", flush=True)
+        return
+
+    if not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM ERROR] Missing TELEGRAM_CHAT_ID", flush=True)
         return
 
     try:
 
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+        response = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg
+            },
             timeout=10
         )
 
+        print(f"[TELEGRAM RESPONSE] {response.status_code} {response.text}", flush=True)
+
     except Exception as e:
 
-        print(f"[TELEGRAM ERROR] {e}", flush=True)
+        print(f"[TELEGRAM EXCEPTION] {e}", flush=True)
 
 # =========================
 # STATE
@@ -74,22 +86,24 @@ def load_state():
 
                 state = json.load(f)
 
-                print("[STATE] Loaded existing state", flush=True)
+                print("[STATE] Loaded", flush=True)
 
                 return state
 
     except Exception as e:
 
-        print("[STATE ERROR]", e, flush=True)
+        print("[STATE LOAD ERROR]", e, flush=True)
 
-    print("[STATE] Creating new state", flush=True)
+    print("[STATE] New state created", flush=True)
 
     return {
+
         "cash": START_BALANCE,
         "positions": {},
         "equity": START_BALANCE,
         "cooldowns": {},
         "peak_equity": START_BALANCE
+
     }
 
 def save_state(state):
@@ -101,13 +115,14 @@ def save_state(state):
         tmp = STATE_FILE + ".tmp"
 
         with open(tmp, "w") as f:
+
             json.dump(state, f)
 
         os.replace(tmp, STATE_FILE)
 
     except Exception as e:
 
-        print("[SAVE ERROR]", e, flush=True)
+        print("[STATE SAVE ERROR]", e, flush=True)
 
 # =========================
 # MARKET
@@ -133,7 +148,9 @@ def get_products():
 
         return random.sample(pairs, min(len(pairs), UNIVERSE_SIZE))
 
-    except:
+    except Exception as e:
+
+        print("[PRODUCT ERROR]", e, flush=True)
 
         return []
 
@@ -182,9 +199,7 @@ def get_trend(product):
         if volatility > 0.05:
             return None
 
-        score = change * random.uniform(1.2, 2.2)
-
-        return score
+        return change * random.uniform(1.2, 2.2)
 
     except:
 
@@ -203,7 +218,6 @@ def calculate_equity(state):
         price = get_price(product)
 
         if price:
-
             total += pos["size"] * price
 
     state["equity"] = total
@@ -214,7 +228,7 @@ def calculate_equity(state):
     return total
 
 # =========================
-# EXPOSURE CONTROL
+# EXPOSURE
 # =========================
 
 def portfolio_exposure(state):
@@ -224,6 +238,9 @@ def portfolio_exposure(state):
     for pos in state["positions"].values():
 
         exposure += pos["size"] * pos["entry"]
+
+    if state["equity"] == 0:
+        return 0
 
     return exposure / state["equity"]
 
@@ -276,10 +293,12 @@ def open_position(state, product):
     state["cash"] -= spend
 
     state["positions"][product] = {
+
         "entry": price,
         "size": size,
         "peak": price,
         "opened": now
+
     }
 
     send(f"BUY {product} @ ${price:.5f}")
@@ -354,7 +373,7 @@ def scanner(state):
 
         if score:
 
-            print(f"[SIGNAL] {product} score={score:.3f}", flush=True)
+            print(f"[SIGNAL] {product} score={score:.4f}", flush=True)
 
             open_position(state, product)
 
@@ -364,11 +383,11 @@ def scanner(state):
 
 def main():
 
-    print("[BOT] FULL SNIPER BOT STARTED", flush=True)
+    print("[BOT] STARTED", flush=True)
 
     state = load_state()
 
-    send("FULL SNIPER BOT STARTED")
+    send("BOT STARTED SUCCESSFULLY")
 
     while True:
 
@@ -376,11 +395,10 @@ def main():
 
             calculate_equity(state)
 
+            send(f"Heartbeat: Equity ${state['equity']:.2f}")
+
             print(
-                f"[{datetime.now()}] "
-                f"Equity=${state['equity']:.2f} "
-                f"Cash=${state['cash']:.2f} "
-                f"Positions={len(state['positions'])}",
+                f"[{datetime.now()}] Equity=${state['equity']:.2f} Cash=${state['cash']:.2f} Positions={len(state['positions'])}",
                 flush=True
             )
 
