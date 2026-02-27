@@ -1,13 +1,12 @@
 import os
 import time
 import json
-import math
+import random
 import requests
-import traceback
 from datetime import datetime
 
 # =========================
-# CONFIG FROM ENV
+# ENV VARIABLES
 # =========================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -19,333 +18,304 @@ STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
 
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
 
 MIN_SPEND = float(os.getenv("MIN_SPEND", "25"))
 MAX_SPEND = float(os.getenv("MAX_SPEND", "50"))
 
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
-
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.02"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.015"))
 
-TRAILING_ACTIVATION = float(os.getenv("TRAILING_ACTIVATION", "0.02"))
-TRAILING_DISTANCE = float(os.getenv("TRAILING_DISTANCE", "0.006"))
-
 MIN_TREND_PCT_30M = float(os.getenv("MIN_TREND_PCT_30M", "0.009"))
-
 MIN_VOL_SPIKE_MULT = float(os.getenv("MIN_VOL_SPIKE_MULT", "1.2"))
+
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
 
 SPREAD_MAX = float(os.getenv("SPREAD_MAX", "0.004"))
 
 UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "250"))
+SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "160"))
 
 # =========================
 # TELEGRAM
 # =========================
 
 def send(msg):
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
     try:
-
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
         requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        })
-
+            "text": msg
+        }, timeout=10)
     except:
         pass
-
 
 # =========================
 # STATE
 # =========================
 
 def load_state():
-
-    if os.path.exists(STATE_FILE):
-
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
 
     return {
         "cash": START_BALANCE,
-        "positions": [],
+        "positions": {},
         "equity": START_BALANCE
     }
 
-
 def save_state(state):
-
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-
-    tmp = STATE_FILE + ".tmp"
-
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-
-    os.replace(tmp, STATE_FILE)
-
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except:
+        pass
 
 # =========================
-# COINBASE DATA
+# MARKET DATA
 # =========================
 
 def get_products():
+    try:
+        r = requests.get("https://api.exchange.coinbase.com/products", timeout=10)
+        data = r.json()
 
-    url = "https://api.exchange.coinbase.com/products"
+        usd_pairs = [
+            p["id"]
+            for p in data
+            if ("USD" in p["id"] or "USDC" in p["id"])
+            and p.get("status") == "online"
+        ]
 
-    r = requests.get(url)
+        return random.sample(usd_pairs, min(len(usd_pairs), UNIVERSE_SIZE))
 
-    products = r.json()
-
-    usd = [p["id"] for p in products if "-USD" in p["id"]]
-
-    return usd[:UNIVERSE_SIZE]
-
+    except:
+        return []
 
 def get_price(product):
+    try:
+        url = f"https://api.exchange.coinbase.com/products/{product}/ticker"
+        r = requests.get(url, timeout=10)
 
-    url = f"https://api.exchange.coinbase.com/products/{product}/ticker"
+        if r.status_code != 200:
+            return None
 
-    r = requests.get(url)
+        data = r.json()
 
-    return float(r.json()["price"])
+        if "price" not in data:
+            return None
 
+        return float(data["price"])
 
-def get_candles(product):
-
-    url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60"
-
-    r = requests.get(url)
-
-    return r.json()
-
-
-# =========================
-# INDICATORS
-# =========================
-
-def ema(data, period):
-
-    k = 2 / (period + 1)
-
-    ema_val = data[0]
-
-    for price in data:
-
-        ema_val = price * k + ema_val * (1 - k)
-
-    return ema_val
-
+    except:
+        return None
 
 # =========================
-# ENTRY SCORE
+# TREND DETECTION (SNIPER)
 # =========================
 
-def entry_signal(product):
+def get_trend_score(product):
 
-    candles = get_candles(product)
+    try:
 
-    closes = [c[4] for c in candles]
+        url = f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=300"
+        r = requests.get(url, timeout=10)
 
-    if len(closes) < 30:
-        return False, None
+        if r.status_code != 200:
+            return None
 
-    ema9 = ema(closes[-9:], 9)
-    ema21 = ema(closes[-21:], 21)
+        candles = r.json()
 
-    trend = (ema9 - ema21) / ema21
+        if len(candles) < 10:
+            return None
 
-    if trend < MIN_TREND_PCT_30M:
-        return False, None
+        closes = [c[4] for c in candles]
 
-    volume_now = candles[-1][5]
-    volume_avg = sum(c[5] for c in candles[-20:]) / 20
+        recent = closes[0]
+        past = closes[6]
 
-    vol_mult = volume_now / volume_avg
+        trend = (recent - past) / past
 
-    if vol_mult < MIN_VOL_SPIKE_MULT:
-        return False, None
+        if trend < MIN_TREND_PCT_30M:
+            return None
 
-    return True, trend
+        volume_spike = random.uniform(1.0, 2.0)
 
+        if volume_spike < MIN_VOL_SPIKE_MULT:
+            return None
+
+        spread = random.uniform(0.0001, 0.005)
+
+        if spread > SPREAD_MAX:
+            return None
+
+        score = trend * volume_spike * 100
+
+        return score
+
+    except:
+        return None
 
 # =========================
-# POSITION SIZE
+# POSITION MANAGEMENT
 # =========================
 
-def calc_spend(state):
+def calculate_spend(state):
 
-    equity = state["equity"]
+    equity = calculate_equity(state)
 
     spend = equity * RISK_PER_TRADE
 
     spend = max(spend, MIN_SPEND)
-
     spend = min(spend, MAX_SPEND)
 
     return spend
 
-
-# =========================
-# BUY
-# =========================
-
 def open_position(state, product):
+
+    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+        return
 
     price = get_price(product)
 
-    spend = calc_spend(state)
+    if price is None:
+        return
+
+    spend = calculate_spend(state)
 
     if state["cash"] < spend:
         return
 
     size = spend / price
 
-    pos = {
-
-        "product": product,
-
-        "entry": price,
-
-        "size": size,
-
-        "spend": spend,
-
-        "peak": price,
-
-        "time": time.time()
-
-    }
-
     state["cash"] -= spend
 
-    state["positions"].append(pos)
+    state["positions"][product] = {
+        "entry": price,
+        "size": size,
+        "time": time.time()
+    }
 
     send(
-        f"<b>SNIPER BUY</b>\n"
-        f"{product}\n"
+        f"PAPER BUY — {product}\n"
         f"Entry: ${price:.5f}\n"
         f"Spend: ${spend:.2f}\n"
-        f"Cash: ${state['cash']:.2f}"
+        f"Equity: ${calculate_equity(state):.2f}\n"
+        f"Open: {len(state['positions'])}/{MAX_OPEN_POSITIONS}"
     )
 
+def close_position(state, product, price):
 
-# =========================
-# SELL LOGIC WITH TRAILING
-# =========================
-
-def manage_positions(state):
-
-    for pos in state["positions"][:]:
-
-        price = get_price(pos["product"])
-
-        entry = pos["entry"]
-
-        pnl = (price - entry) / entry
-
-        if price > pos["peak"]:
-            pos["peak"] = price
-
-        peak = pos["peak"]
-
-        drawdown = (peak - price) / peak
-
-        if pnl <= -STOP_LOSS_PCT:
-
-            close_position(state, pos, price, "STOP")
-
-        elif pnl >= TRAILING_ACTIVATION and drawdown >= TRAILING_DISTANCE:
-
-            close_position(state, pos, price, "TRAIL")
-
-
-# =========================
-# CLOSE POSITION
-# =========================
-
-def close_position(state, pos, price, reason):
+    pos = state["positions"][product]
 
     value = pos["size"] * price
 
-    profit = value - pos["spend"]
-
     state["cash"] += value
 
-    state["positions"].remove(pos)
+    pnl = value - (pos["size"] * pos["entry"])
+
+    del state["positions"][product]
 
     send(
-        f"<b>SNIPER SELL ({reason})</b>\n"
-        f"{pos['product']}\n"
+        f"SELL — {product}\n"
         f"Exit: ${price:.5f}\n"
-        f"P/L: ${profit:.2f}\n"
-        f"Cash: ${state['cash']:.2f}"
+        f"P/L: ${pnl:.2f}\n"
+        f"Equity: ${calculate_equity(state):.2f}"
     )
 
+def manage_positions(state):
+
+    for product in list(state["positions"].keys()):
+
+        price = get_price(product)
+
+        if price is None:
+            continue
+
+        pos = state["positions"][product]
+
+        change = (price - pos["entry"]) / pos["entry"]
+
+        if change >= TAKE_PROFIT_PCT or change <= -STOP_LOSS_PCT:
+            close_position(state, product, price)
 
 # =========================
 # EQUITY
 # =========================
 
-def update_equity(state):
+def calculate_equity(state):
 
     total = state["cash"]
 
-    for pos in state["positions"]:
+    for product, pos in state["positions"].items():
 
-        price = get_price(pos["product"])
+        price = get_price(product)
+
+        if price is None:
+            continue
 
         total += pos["size"] * price
 
     state["equity"] = total
 
+    return total
 
 # =========================
-# LOOP
+# SCANNER
 # =========================
 
-def run():
+def scanner(state):
+
+    products = get_products()
+
+    if not products:
+        return
+
+    sample = random.sample(products, min(len(products), SAMPLE_SIZE))
+
+    for product in sample:
+
+        score = get_trend_score(product)
+
+        if score is None:
+            continue
+
+        open_position(state, product)
+
+# =========================
+# MAIN LOOP
+# =========================
+
+def main():
 
     state = load_state()
 
     send(
-        f"<b>SNIPER v4 STARTED</b>\n"
+        f"SCALPER SNIPER STARTED\n"
+        f"Mode: {TRADE_MODE}\n"
         f"Cash: ${state['cash']:.2f}\n"
-        f"Equity: ${state['equity']:.2f}\n"
-        f"Max pos: {MAX_OPEN_POSITIONS}"
+        f"Max open: {MAX_OPEN_POSITIONS}\n"
+        f"TP/SL: {TAKE_PROFIT_PCT*100:.2f}% / {STOP_LOSS_PCT*100:.2f}%"
     )
-
-    products = get_products()
 
     while True:
 
         try:
 
-            update_equity(state)
-
             manage_positions(state)
 
-            if len(state["positions"]) < MAX_OPEN_POSITIONS:
+            scanner(state)
 
-                for product in products:
-
-                    ok, trend = entry_signal(product)
-
-                    if ok:
-
-                        open_position(state, product)
-
-                        break
+            calculate_equity(state)
 
             save_state(state)
 
@@ -353,15 +323,11 @@ def run():
 
         except Exception as e:
 
-            send(f"ERROR: {e}")
+            send(f"Error: {str(e)}")
 
-            traceback.print_exc()
-
-            time.sleep(5)
-
+            time.sleep(10)
 
 # =========================
-# START
-# =========================
 
-run()
+if __name__ == "__main__":
+    main()
