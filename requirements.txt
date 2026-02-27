@@ -1,3 +1,5 @@
 requests
 websocket-client
 scikit-learn
+numpy
+
