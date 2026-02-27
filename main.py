@@ -19,22 +19,23 @@ START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.03"))
 
 MIN_SPEND = float(os.getenv("MIN_SPEND", "25"))
-MAX_SPEND = float(os.getenv("MAX_SPEND", "200"))
+MAX_SPEND = float(os.getenv("MAX_SPEND", "300"))
 
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "25"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "30"))
 
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.025"))
-
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.03"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))
-
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "0.015"))
 
-MIN_TREND_PCT = float(os.getenv("MIN_TREND_PCT", "0.008"))
+MIN_TREND_PCT = float(os.getenv("MIN_TREND_PCT", "0.007"))
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))
 
-UNIVERSE_SIZE = 300
-SAMPLE_SIZE = 180
+UNIVERSE_SIZE = 350
+SAMPLE_SIZE = 200
+
+COOLDOWN_SECONDS = 600
+MAX_PORTFOLIO_EXPOSURE = 0.85
 
 # =========================
 # TELEGRAM
@@ -49,19 +50,10 @@ def send(msg):
 
     try:
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
         requests.post(
-
-            url,
-
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg
-            },
-
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
-
         )
 
     except Exception as e:
@@ -82,20 +74,22 @@ def load_state():
 
                 state = json.load(f)
 
-                print("[STATE] Loaded", flush=True)
+                print("[STATE] Loaded existing state", flush=True)
 
                 return state
 
     except Exception as e:
 
-        print(f"[STATE LOAD ERROR] {e}", flush=True)
+        print("[STATE ERROR]", e, flush=True)
+
+    print("[STATE] Creating new state", flush=True)
 
     return {
-
         "cash": START_BALANCE,
         "positions": {},
-        "equity": START_BALANCE
-
+        "equity": START_BALANCE,
+        "cooldowns": {},
+        "peak_equity": START_BALANCE
     }
 
 def save_state(state):
@@ -107,14 +101,13 @@ def save_state(state):
         tmp = STATE_FILE + ".tmp"
 
         with open(tmp, "w") as f:
-
             json.dump(state, f)
 
         os.replace(tmp, STATE_FILE)
 
     except Exception as e:
 
-        print(f"[STATE SAVE ERROR] {e}", flush=True)
+        print("[SAVE ERROR]", e, flush=True)
 
 # =========================
 # MARKET
@@ -125,24 +118,17 @@ def get_products():
     try:
 
         r = requests.get(
-
             "https://api.exchange.coinbase.com/products",
-
             timeout=10
-
         )
 
         data = r.json()
 
         pairs = [
-
             p["id"]
-
             for p in data
-
             if ("USD" in p["id"] or "USDC" in p["id"])
             and p.get("status") == "online"
-
         ]
 
         return random.sample(pairs, min(len(pairs), UNIVERSE_SIZE))
@@ -156,11 +142,8 @@ def get_price(product):
     try:
 
         r = requests.get(
-
             f"https://api.exchange.coinbase.com/products/{product}/ticker",
-
             timeout=10
-
         )
 
         return float(r.json()["price"])
@@ -178,27 +161,28 @@ def get_trend(product):
     try:
 
         r = requests.get(
-
             f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=300",
-
             timeout=10
-
         )
 
         candles = r.json()
 
-        if len(candles) < 10:
+        if len(candles) < 12:
             return None
 
-        recent = candles[0][4]
-        past = candles[6][4]
+        closes = [c[4] for c in candles]
 
-        change = (recent - past) / past
+        change = (closes[0] - closes[8]) / closes[8]
+
+        volatility = abs(closes[0] - closes[1]) / closes[1]
 
         if change < MIN_TREND_PCT:
             return None
 
-        score = change * random.uniform(1.2, 2.5)
+        if volatility > 0.05:
+            return None
+
+        score = change * random.uniform(1.2, 2.2)
 
         return score
 
@@ -224,7 +208,24 @@ def calculate_equity(state):
 
     state["equity"] = total
 
+    if total > state["peak_equity"]:
+        state["peak_equity"] = total
+
     return total
+
+# =========================
+# EXPOSURE CONTROL
+# =========================
+
+def portfolio_exposure(state):
+
+    exposure = 0
+
+    for pos in state["positions"].values():
+
+        exposure += pos["size"] * pos["entry"]
+
+    return exposure / state["equity"]
 
 # =========================
 # POSITION SIZE
@@ -247,7 +248,17 @@ def get_spend(state):
 
 def open_position(state, product):
 
+    now = time.time()
+
+    if product in state["cooldowns"]:
+
+        if now - state["cooldowns"][product] < COOLDOWN_SECONDS:
+            return
+
     if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+        return
+
+    if portfolio_exposure(state) > MAX_PORTFOLIO_EXPOSURE:
         return
 
     price = get_price(product)
@@ -265,11 +276,10 @@ def open_position(state, product):
     state["cash"] -= spend
 
     state["positions"][product] = {
-
         "entry": price,
         "size": size,
-        "peak": price
-
+        "peak": price,
+        "opened": now
     }
 
     send(f"BUY {product} @ ${price:.5f}")
@@ -290,10 +300,12 @@ def close_position(state, product, price, reason):
 
     del state["positions"][product]
 
+    state["cooldowns"][product] = time.time()
+
     send(f"SELL {product} @ ${price:.5f} | PNL ${pnl:.2f} | {reason}")
 
 # =========================
-# TRAILING STOP MANAGEMENT
+# POSITION MANAGEMENT
 # =========================
 
 def manage_positions(state):
@@ -308,28 +320,22 @@ def manage_positions(state):
             continue
 
         entry = pos["entry"]
-
         peak = pos["peak"]
 
         if price > peak:
-
             pos["peak"] = price
             peak = price
 
         drawdown = (peak - price) / peak
-
         profit = (price - entry) / entry
 
         if drawdown >= TRAILING_STOP_PCT:
-
             close_position(state, product, price, "TRAILING STOP")
 
         elif profit >= TAKE_PROFIT_PCT:
-
             close_position(state, product, price, "TAKE PROFIT")
 
         elif profit <= -STOP_LOSS_PCT:
-
             close_position(state, product, price, "STOP LOSS")
 
 # =========================
@@ -348,7 +354,7 @@ def scanner(state):
 
         if score:
 
-            print(f"[SIGNAL] {product} score={score:.2f}", flush=True)
+            print(f"[SIGNAL] {product} score={score:.3f}", flush=True)
 
             open_position(state, product)
 
@@ -358,35 +364,29 @@ def scanner(state):
 
 def main():
 
-    print("[BOT] STARTED", flush=True)
+    print("[BOT] FULL SNIPER BOT STARTED", flush=True)
 
     state = load_state()
 
-    send("SNIPER BOT STARTED")
+    send("FULL SNIPER BOT STARTED")
 
     while True:
 
         try:
 
+            calculate_equity(state)
+
             print(
-
                 f"[{datetime.now()}] "
-
                 f"Equity=${state['equity']:.2f} "
-
                 f"Cash=${state['cash']:.2f} "
-
                 f"Positions={len(state['positions'])}",
-
                 flush=True
-
             )
 
             manage_positions(state)
 
             scanner(state)
-
-            calculate_equity(state)
 
             save_state(state)
 
@@ -394,7 +394,7 @@ def main():
 
         except Exception as e:
 
-            print(f"[ERROR] {e}", flush=True)
+            print("[ERROR]", e, flush=True)
 
             send(f"ERROR {e}")
 
