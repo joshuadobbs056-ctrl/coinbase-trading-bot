@@ -390,4 +390,264 @@ def continuation_signal(product_id: str) -> Optional[Dict]:
     if curr_mom_5m < MIN_MOMENTUM_PCT_5M:
         return None
 
-    # Pullback
+    # Pullback proximity to EMA_FAST (within tolerance)
+    # distance = (prev_close - ema_fast_prev)/ema_fast_prev
+    ema_fast_prev = ema_fast_series[-2]
+    if ema_fast_prev <= 0:
+        return None
+
+    prev_dist_pct = abs(pct_change(ema_fast_prev, prev_close))  # how far prev_close from EMA_FAST
+    # Require it was close to EMA_FAST recently (a pullback), AND now it's reclaiming above EMA_FAST
+    if prev_dist_pct > PULLBACK_TOL_PCT:
+        return None
+    if curr_close <= ema_fast_now:
+        return None
+
+    # 5) Volume confirmation: last candle vol above average
+    # Compare last candle vol to average of prior 12
+    if len(vols) < 20:
+        return None
+    base_vol = sum(vols[-13:-1]) / 12.0
+    vol_mult = (vols[-1] / base_vol) if base_vol > 0 else 0.0
+    if vol_mult < MIN_VOL_SPIKE_MULT:
+        return None
+
+    # Score: prefer stronger trend + momentum + vol, penalize spread
+    score = (
+        (trend_30m * 1.2) +
+        (curr_mom_5m * 2.0) +
+        (vol_mult * 1.0) +
+        (ema_fast_slope * 0.8) +
+        (ema_slow_slope * 0.4) -
+        (sp * 1.8)
+    )
+
+    return {
+        "product_id": product_id,
+        "price": curr_close,
+        "spread": sp,
+        "trend_30m": trend_30m,
+        "mom_5m": curr_mom_5m,
+        "vol_mult": vol_mult,
+        "ema_fast": ema_fast_now,
+        "ema_slow": ema_slow_now,
+        "score": score
+    }
+
+# -------------------------
+# PAPER TRADING (AUTO SELL)
+# -------------------------
+
+def open_position(state: Dict, sig: Dict) -> None:
+    pid = sig["product_id"]
+    base = base_symbol_from_product(pid)
+
+    # Avoid duplicates by base coin
+    held_bases = currently_held_bases(state)
+    if base in held_bases:
+        return
+
+    if pid in state["positions"]:
+        return
+    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+        return
+
+    spend = dynamic_trade_size(state)
+    if cash(state) < spend:
+        return
+
+    entry = float(sig["price"])
+    net_spend, fee = apply_fee(spend)
+    size_base = net_spend / entry if entry > 0 else 0.0
+    if size_base <= 0:
+        return
+
+    state["paper"]["cash"] = cash(state) - spend
+    state["paper"]["fees_paid"] = float(state["paper"]["fees_paid"]) + fee
+    state["paper"]["trades"] = int(state["paper"]["trades"]) + 1
+
+    state["positions"][pid] = {
+        "base": base,
+        "entry_price": entry,
+        "entry_ts": now_ts(),
+        "base_size": size_base,
+        "last_price": entry
+    }
+    save_state(state)
+
+    telegram_send(
+        f"<b>PAPER BUY</b> — <b>{pid}</b>\n"
+        f"Entry: <b>${entry:.6g}</b> | Spend: <b>{fmt_money(spend)}</b>\n"
+        f"Trend30m: <b>+{sig['trend_30m']:.2f}%</b> | Mom5m: <b>+{sig['mom_5m']:.2f}%</b>\n"
+        f"Vol: <b>{sig['vol_mult']:.2f}x</b> | Spread: <b>{sig['spread']:.2f}%</b>\n"
+        f"Open: <b>{len(state['positions'])}/{MAX_OPEN_POSITIONS}</b> | Equity: <b>{fmt_money(current_equity(state))}</b>"
+    )
+
+def close_position(state: Dict, pid: str, price: float, reason: str) -> None:
+    pos = state["positions"].get(pid)
+    if not pos:
+        return
+
+    size_base = float(pos["base_size"])
+    entry = float(pos["entry_price"])
+
+    gross = size_base * price
+    net, fee = apply_fee(gross)
+    cost = size_base * entry
+
+    pnl = net - cost
+    pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
+
+    state["paper"]["cash"] = cash(state) + net
+    state["paper"]["fees_paid"] = float(state["paper"]["fees_paid"]) + fee
+    state["paper"]["realized_pnl"] = float(state["paper"]["realized_pnl"]) + pnl
+    state["paper"]["trades"] = int(state["paper"]["trades"]) + 1
+
+    if pnl >= 0:
+        state["paper"]["wins"] = int(state["paper"]["wins"]) + 1
+    else:
+        state["paper"]["losses"] = int(state["paper"]["losses"]) + 1
+
+    state["positions"].pop(pid, None)
+    save_state(state)
+
+    telegram_send(
+        f"<b>PAPER SELL</b> — <b>{pid}</b>\n"
+        f"Reason: <b>{reason}</b>\n"
+        f"Exit: <b>${price:.6g}</b>\n"
+        f"PnL: <b>{fmt_money(pnl)}</b> ({pnl_pct:+.2f}%)\n"
+        f"Open: <b>{len(state['positions'])}/{MAX_OPEN_POSITIONS}</b> | Equity: <b>{fmt_money(current_equity(state))}</b>"
+    )
+
+def manage_positions(state: Dict) -> None:
+    # For each open position, check TP/SL/timeouts
+    for pid in list(state["positions"].keys()):
+        pos = state["positions"][pid]
+
+        # Pull a small candle window for last price
+        data = get_candles_close_vol(pid, 12)  # last hour
+        if not data:
+            continue
+
+        price = data[0][-1]
+        pos["last_price"] = price
+
+        entry = float(pos["entry_price"])
+        change = pct_change(entry, price)
+        age = now_ts() - int(pos["entry_ts"])
+
+        if change >= TAKE_PROFIT_PCT:
+            close_position(state, pid, price, f"TP {TAKE_PROFIT_PCT:.2f}%")
+        elif change <= -STOP_LOSS_PCT:
+            close_position(state, pid, price, f"SL {STOP_LOSS_PCT:.2f}%")
+        elif age >= MAX_HOLD_SECONDS:
+            close_position(state, pid, price, f"MAX_HOLD {MAX_HOLD_SECONDS//60}m")
+
+# -------------------------
+# MAIN LOOP
+# -------------------------
+
+def main() -> None:
+    if TRADE_MODE != "paper":
+        telegram_send(
+            "<b>WARNING</b>\n"
+            "This file currently supports <b>paper</b> execution only.\n"
+            "Live trading requires authenticated Coinbase order endpoints.\n"
+            "Leave TRADE_MODE=paper for now."
+        )
+
+    state = load_state()
+
+    telegram_send(
+        f"<b>SCALPER SNIPER STARTED</b>\n"
+        f"Mode: <b>{TRADE_MODE.upper()}</b>\n"
+        f"State: <b>{STATE_FILE}</b>\n"
+        f"Cash: <b>{fmt_money(cash(state))}</b> | Equity: <b>{fmt_money(current_equity(state))}</b>\n"
+        f"Max open: <b>{MAX_OPEN_POSITIONS}</b> | Scan: <b>{SCAN_INTERVAL_SECONDS}s</b>\n"
+        f"Universe: <b>{MAX_PRODUCTS}</b> | Sample/cycle: <b>{SCAN_SAMPLE_SIZE}</b>\n"
+        f"TP/SL: <b>+{TAKE_PROFIT_PCT:.2f}%</b> / <b>-{STOP_LOSS_PCT:.2f}%</b>\n"
+        f"Trend: EMA{EMA_FAST}/EMA{EMA_SLOW} | 30m min: <b>{MIN_TREND_PCT_30M:.2f}%</b>\n"
+        f"VolSpike: <b>{MIN_VOL_SPIKE_MULT:.2f}x</b> | SpreadMax: <b>{MAX_SPREAD_PCT:.2f}%</b>\n"
+        f"Compounding: <b>{'ON' if USE_COMPOUNDING else 'OFF'}</b> | Risk: <b>{RISK_PCT_PER_TRADE:.2f}%</b>\n"
+        f"Min/Max spend: <b>{fmt_money(MIN_TRADE_USD)}</b> / <b>{fmt_money(MAX_TRADE_USD)}</b>"
+    )
+
+    products: List[str] = []
+    last_refresh = 0
+
+    while True:
+        try:
+            state["cycle"] = int(state.get("cycle", 0)) + 1
+
+            # Refresh products every 30 minutes
+            if not products or (now_ts() - last_refresh) > 1800:
+                products = list_usd_products(MAX_PRODUCTS)
+                random.shuffle(products)
+                last_refresh = now_ts()
+                print(f"[info] products loaded: {len(products)}", flush=True)
+
+            # 1) Exits first
+            manage_positions(state)
+
+            # 2) Fill slots with best continuation setups
+            slots = MAX_OPEN_POSITIONS - len(state["positions"])
+            if slots > 0 and products:
+                # sample a subset each cycle for speed + to avoid hammering APIs
+                sample_size = min(SCAN_SAMPLE_SIZE, len(products))
+                universe = random.sample(products, sample_size)
+
+                held_bases = currently_held_bases(state)
+
+                candidates: List[Dict] = []
+                for pid in universe:
+                    # skip if base already held
+                    if base_symbol_from_product(pid) in held_bases:
+                        continue
+                    # skip if already in positions
+                    if pid in state["positions"]:
+                        continue
+
+                    sig = continuation_signal(pid)
+                    if sig:
+                        candidates.append(sig)
+
+                candidates.sort(key=lambda x: x["score"], reverse=True)
+
+                # Attempt to open up to "slots" positions
+                opened = 0
+                for sig in candidates:
+                    if opened >= slots:
+                        break
+                    before = len(state["positions"])
+                    open_position(state, sig)
+                    after = len(state["positions"])
+                    if after > before:
+                        opened += 1
+                        held_bases.add(base_symbol_from_product(sig["product_id"]))
+
+            # Heartbeat (so you know it's alive)
+            if HEARTBEAT_EVERY_CYCLES > 0 and (state["cycle"] % HEARTBEAT_EVERY_CYCLES == 0):
+                eq = current_equity(state)
+                p = state["paper"]
+                wins = int(p.get("wins", 0))
+                losses = int(p.get("losses", 0))
+                total_closed = wins + losses
+                winrate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
+                telegram_send(
+                    f"<b>HEARTBEAT</b>\n"
+                    f"Open: <b>{len(state['positions'])}/{MAX_OPEN_POSITIONS}</b>\n"
+                    f"Cash: <b>{fmt_money(cash(state))}</b> | Equity: <b>{fmt_money(eq)}</b>\n"
+                    f"RealizedPnL: <b>{fmt_money(float(p.get('realized_pnl', 0.0)))}</b>\n"
+                    f"Fees: <b>{fmt_money(float(p.get('fees_paid', 0.0)))}</b>\n"
+                    f"Win rate: <b>{winrate:.1f}%</b> | Trades: <b>{int(p.get('trades', 0))}</b>"
+                )
+
+            save_state(state)
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except Exception as e:
+            print(f"[error] {type(e).__name__}: {e}", flush=True)
+            time.sleep(max(5, SCAN_INTERVAL_SECONDS))
+
+if __name__ == "__main__":
+    main()
