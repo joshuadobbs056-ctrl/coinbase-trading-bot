@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 #########################################
-# CONFIG
+# VARIABLES FROM RAILWAY
 #########################################
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
@@ -17,11 +17,13 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", 3))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+START_BALANCE = float(os.getenv("START_BALANCE", 1000))
+
 #########################################
-# TELEGRAM
+# TELEGRAM FUNCTION
 #########################################
 
-def send_telegram(msg):
+def send_telegram(message):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -31,15 +33,14 @@ def send_telegram(msg):
 
         requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
+            "text": message
         })
 
     except:
         pass
 
-
 #########################################
-# LEARNING SYSTEM (LEVEL 1)
+# LEARNING SYSTEM
 #########################################
 
 LEARNING_FILE = "learning.json"
@@ -48,7 +49,6 @@ HISTORY_FILE = "trade_history.csv"
 def load_learning():
 
     if os.path.exists(LEARNING_FILE):
-
         with open(LEARNING_FILE, "r") as f:
             return json.load(f)
 
@@ -60,21 +60,19 @@ def load_learning():
             "momentum": 1.0
         },
         "trade_count": 0,
-        "win_count": 0
+        "win_count": 0,
+        "total_profit": 0.0
     }
-
 
 def save_learning():
 
     with open(LEARNING_FILE, "w") as f:
         json.dump(learning, f)
 
-
 learning = load_learning()
 
-
 #########################################
-# HISTORY FILE INIT
+# INIT HISTORY FILE
 #########################################
 
 if not os.path.exists(HISTORY_FILE):
@@ -91,13 +89,11 @@ if not os.path.exists(HISTORY_FILE):
             "profit"
         ])
 
-
 #########################################
-# MACHINE LEARNING (LEVEL 2)
+# MACHINE LEARNING MODEL
 #########################################
 
 model = None
-
 
 def train_model():
 
@@ -118,14 +114,13 @@ def train_model():
 
         model.fit(X, y)
 
-        send_telegram("AI model trained on trade history")
+        send_telegram("AI model retrained")
 
     except:
         pass
 
-
 #########################################
-# SCORING
+# SCORE CALCULATION
 #########################################
 
 def calculate_score(rsi, volume_ratio, trend_strength, momentum):
@@ -148,7 +143,6 @@ def calculate_score(rsi, volume_ratio, trend_strength, momentum):
 
     return score
 
-
 #########################################
 # ML FILTER
 #########################################
@@ -167,26 +161,33 @@ def ml_allows(features):
     except:
         return True
 
+#########################################
+# BALANCE TRACKING
+#########################################
+
+current_balance = START_BALANCE
+
+def get_balance():
+    return current_balance
 
 #########################################
-# RECORD TRADE RESULT
+# TRADE STORAGE
 #########################################
 
-def record_trade(rsi, volume_ratio, trend_strength, momentum, profit):
+open_trades = []
 
-    with open(HISTORY_FILE, "a", newline="") as f:
+#########################################
+# RECORD TRADE
+#########################################
 
-        writer = csv.writer(f)
+def record_trade(trade, profit):
 
-        writer.writerow([
-            rsi,
-            volume_ratio,
-            trend_strength,
-            momentum,
-            profit
-        ])
+    global current_balance
+
+    current_balance += profit
 
     learning["trade_count"] += 1
+    learning["total_profit"] += profit
 
     if profit > 0:
 
@@ -199,46 +200,73 @@ def record_trade(rsi, volume_ratio, trend_strength, momentum, profit):
 
         learning["weights"]["volume"] -= 0.01
 
+    with open(HISTORY_FILE, "a", newline="") as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            trade["rsi"],
+            trade["volume_ratio"],
+            trade["trend_strength"],
+            trade["momentum"],
+            profit
+        ])
+
     save_learning()
 
     train_model()
 
+#########################################
+# STATUS ALERT
+#########################################
+
+def send_status():
+
+    balance = get_balance()
+
+    profit = learning["total_profit"]
+
+    open_count = len(open_trades)
+
+    wins = learning["win_count"]
+    total = learning["trade_count"]
+
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    msg = (
+        f"STATUS\n"
+        f"Balance: ${balance:.2f}\n"
+        f"Profit: ${profit:.2f}\n"
+        f"Open trades: {open_count}\n"
+        f"Win rate: {win_rate:.1f}%"
+    )
+
+    send_telegram(msg)
 
 #########################################
-# MOCK MARKET DATA (REPLACE WITH REAL)
+# MARKET DATA (replace later with Coinbase)
 #########################################
 
 def get_market_data():
-
-    # Replace this with real exchange API
 
     rsi = np.random.uniform(40, 70)
     volume_ratio = np.random.uniform(1.0, 2.5)
     trend_strength = np.random.uniform(0.4, 1.0)
     momentum = np.random.uniform(-1, 1)
+    price = np.random.uniform(90, 110)
 
-    return rsi, volume_ratio, trend_strength, momentum
-
-
-#########################################
-# TRADE STORAGE
-#########################################
-
-open_trades = []
-
+    return rsi, volume_ratio, trend_strength, momentum, price
 
 #########################################
-# BUY
+# OPEN TRADE
 #########################################
 
 def open_trade():
 
-    global open_trades
-
     if len(open_trades) >= MAX_OPEN_TRADES:
         return
 
-    rsi, volume_ratio, trend_strength, momentum = get_market_data()
+    rsi, volume_ratio, trend_strength, momentum, price = get_market_data()
 
     score = calculate_score(
         rsi,
@@ -261,17 +289,20 @@ def open_trade():
             "volume_ratio": volume_ratio,
             "trend_strength": trend_strength,
             "momentum": momentum,
-            "entry_time": time.time(),
-            "entry_price": np.random.uniform(90, 110)
+            "entry_price": price,
+            "entry_time": time.time()
         }
 
         open_trades.append(trade)
 
-        send_telegram(f"BUY opened | score {round(score,2)}")
-
+        send_telegram(
+            f"BUY\n"
+            f"Price: ${price:.2f}\n"
+            f"Score: {score:.2f}"
+        )
 
 #########################################
-# SELL SIMULATION
+# CLOSE TRADES
 #########################################
 
 def manage_trades():
@@ -288,16 +319,13 @@ def manage_trades():
 
             profit = exit_price - trade["entry_price"]
 
-            record_trade(
-                trade["rsi"],
-                trade["volume_ratio"],
-                trade["trend_strength"],
-                trade["momentum"],
-                profit
-            )
+            record_trade(trade, profit)
 
             send_telegram(
-                f"SELL closed | profit {round(profit,2)}"
+                f"SELL\n"
+                f"Entry: ${trade['entry_price']:.2f}\n"
+                f"Exit: ${exit_price:.2f}\n"
+                f"P/L: ${profit:.2f}"
             )
 
         else:
@@ -306,14 +334,19 @@ def manage_trades():
 
     open_trades = remaining
 
+#########################################
+# STARTUP
+#########################################
+
+send_telegram("AI adaptive trading bot started")
+
+train_model()
+
+last_status = time.time()
 
 #########################################
 # MAIN LOOP
 #########################################
-
-send_telegram("AI adaptive bot started")
-
-train_model()
 
 while True:
 
@@ -322,6 +355,12 @@ while True:
         open_trade()
 
         manage_trades()
+
+        if time.time() - last_status > 300:
+
+            send_status()
+
+            last_status = time.time()
 
         time.sleep(SCAN_INTERVAL)
 
