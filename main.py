@@ -1,313 +1,412 @@
 import os
 import time
 import json
+from typing import Dict, List, Optional, Tuple
+
 import requests
-import statistics
-import sys
 
 # =========================
-# CONFIG
+# ENV / CONFIG
 # =========================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+TRADE_MODE = os.getenv("TRADE_MODE", "paper").lower()
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-START_BALANCE = float(os.getenv("PAPER_START_BALANCE", 1000))
-TRADE_SIZE = float(os.getenv("QUOTE_PER_TRADE_USD", 25))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 1))
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "1000"))
+PAPER_FEE_PCT = float(os.getenv("PAPER_FEE_PCT", "0.006"))  # 0.6%/side simulation
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", 60))
+QUOTE_PER_TRADE_USD = float(os.getenv("QUOTE_PER_TRADE_USD", "50"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
 
-TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", 1.6))
-STOP_LOSS = float(os.getenv("STOP_LOSS_PCT", -0.9))
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
+MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "400"))
 
-FEE = float(os.getenv("PAPER_FEE_PCT", 0.004))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.2"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.8"))
+MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "3600"))
 
-print("BOOT: Starting bot...", flush=True)
+MIN_MOMENTUM_PCT_5M = float(os.getenv("MIN_MOMENTUM_PCT_5M", "0.35"))
+MIN_VOL_SPIKE_MULT = float(os.getenv("MIN_VOL_SPIKE_MULT", "1.3"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.40"))
+
+HTTP_TIMEOUT = 15
+USER_AGENT = "scalper-bot/2.0"
+
+# Coinbase Advanced Trade public endpoints (no keys needed)
+BASE_URL = "https://api.coinbase.com"
+PRODUCTS_URL = BASE_URL + "/api/v3/brokerage/market/products"
+CANDLES_URL = BASE_URL + "/api/v3/brokerage/market/products/{product_id}/candles"
+BOOK_URL = BASE_URL + "/api/v3/brokerage/market/product_book"
+
+GRANULARITY = "FIVE_MINUTE"   # scalping
+LOOKBACK = 40                 # 40x5m = ~3h20m history (more than enough)
 
 # =========================
-# TELEGRAM
+# HELPERS
 # =========================
 
-def telegram(msg):
+def now_ts() -> int:
+    return int(time.time())
 
+def pct_change(a: float, b: float) -> float:
+    if a <= 0:
+        return 0.0
+    return (b - a) / a * 100.0
+
+def fmt_money(x: float) -> str:
+    sign = "-" if x < 0 else ""
+    x = abs(x)
+    return f"{sign}${x:,.2f}"
+
+def http_get_json(url: str, params: Optional[Dict] = None) -> Dict:
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    r = requests.get(url, params=params or {}, headers=headers, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def telegram_send(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(msg, flush=True)
         return
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML"
-            },
-            timeout=10
-        )
-
-    except Exception as e:
-        print("Telegram error:", e, flush=True)
+        requests.post(url, json=payload, timeout=HTTP_TIMEOUT).raise_for_status()
+    except Exception:
+        print("[warn] telegram send failed", flush=True)
 
 # =========================
-# STATE
+# STATE (paper account)
 # =========================
 
-def ensure_dir():
+def fresh_state() -> Dict:
+    return {
+        "paper": {
+            "start_balance": PAPER_START_BALANCE,
+            "cash": PAPER_START_BALANCE,
+            "realized_pnl": 0.0,
+            "fees_paid": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "trades": 0
+        },
+        "positions": {},  # product_id -> dict
+        "last_products_refresh": 0
+    }
 
-    directory = os.path.dirname(STATE_FILE)
+def ensure_state_dir() -> None:
+    d = os.path.dirname(STATE_FILE)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-
-def load_state():
-
-    ensure_dir()
-
+def load_state() -> Dict:
+    ensure_state_dir()
     if not os.path.exists(STATE_FILE):
-
-        print("BOOT: Creating new state", flush=True)
-
-        return {
-            "cash": START_BALANCE,
-            "positions": {},
-            "profit": 0
-        }
-
+        return fresh_state()
     try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        if "paper" not in s or "positions" not in s:
+            return fresh_state()
+        # backfill
+        s["paper"].setdefault("start_balance", PAPER_START_BALANCE)
+        s["paper"].setdefault("cash", s["paper"]["start_balance"])
+        s["paper"].setdefault("realized_pnl", 0.0)
+        s["paper"].setdefault("fees_paid", 0.0)
+        s["paper"].setdefault("wins", 0)
+        s["paper"].setdefault("losses", 0)
+        s["paper"].setdefault("trades", 0)
+        s.setdefault("positions", {})
+        s.setdefault("last_products_refresh", 0)
+        return s
+    except Exception:
+        return fresh_state()
 
-        print("BOOT: Loading state", flush=True)
-
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-
-    except Exception as e:
-
-        print("State load error:", e, flush=True)
-
-        return {
-            "cash": START_BALANCE,
-            "positions": {},
-            "profit": 0
-        }
-
-def save_state(state):
-
-    ensure_dir()
-
+def save_state(state: Dict) -> None:
+    ensure_state_dir()
     tmp = STATE_FILE + ".tmp"
-
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
     os.replace(tmp, STATE_FILE)
 
+def cash(state: Dict) -> float:
+    return float(state["paper"].get("cash", 0.0))
+
+def apply_fee(amount: float) -> Tuple[float, float]:
+    fee = abs(amount) * PAPER_FEE_PCT
+    return amount - fee, fee
+
 # =========================
-# COINBASE
+# COINBASE DATA
 # =========================
 
-def get_products():
+def list_usd_products(limit: int) -> List[str]:
+    products: List[str] = []
+    cursor = None
+    while len(products) < limit:
+        params = {}
+        if cursor:
+            params["cursor"] = cursor
+        data = http_get_json(PRODUCTS_URL, params=params)
+        for p in (data.get("products") or []):
+            pid = p.get("product_id")
+            if not pid:
+                continue
+            quote = (p.get("quote_display_symbol") or "").upper()
+            if quote != "USD":
+                continue
+            if bool(p.get("is_disabled", False)) or bool(p.get("trading_disabled", False)):
+                continue
+            name = (p.get("display_name") or "").upper()
+            if "PERP" in name:
+                continue
+            products.append(pid)
+            if len(products) >= limit:
+                break
+        pag = data.get("pagination") or {}
+        cursor = pag.get("next_cursor")
+        if not cursor or not pag.get("has_next", False):
+            break
+    return products
 
-    print("SCAN: Fetching products...", flush=True)
+def get_candles_close_vol(product_id: str, lookback: int) -> Optional[Tuple[List[float], List[float]]]:
+    end_ts = now_ts()
+    start_ts = end_ts - (lookback + 10) * 300  # 5m candles
+    url = CANDLES_URL.format(product_id=product_id)
+    params = {"start": str(start_ts), "end": str(end_ts), "granularity": GRANULARITY}
+    data = http_get_json(url, params=params)
+    raw = data.get("candles") or []
+    if len(raw) < lookback:
+        return None
+    raw_sorted = sorted(raw, key=lambda c: int(c["start"]))[-lookback:]
+    closes = [float(c["close"]) for c in raw_sorted]
+    vols = [float(c["volume"]) for c in raw_sorted]
+    if closes[-1] <= 0:
+        return None
+    return closes, vols
 
+def get_spread_pct(product_id: str) -> Optional[float]:
     try:
-
-        r = requests.get(
-            "https://api.exchange.coinbase.com/products",
-            timeout=10
-        )
-
-        products = [
-            p["id"]
-            for p in r.json()
-            if p["quote_currency"] == "USD"
-            and p["status"] == "online"
-        ]
-
-        print(f"SCAN: Found {len(products)} products", flush=True)
-
-        return products
-
-    except Exception as e:
-
-        print("Product fetch error:", e, flush=True)
-
-        return []
-
-def get_price(product):
-
-    try:
-
-        r = requests.get(
-            f"https://api.exchange.coinbase.com/products/{product}/ticker",
-            timeout=5
-        )
-
-        return float(r.json()["price"])
-
-    except:
+        data = http_get_json(BOOK_URL, params={"product_id": product_id, "limit": "1"})
+        pb = data.get("pricebook") or {}
+        bids = pb.get("bids") or []
+        asks = pb.get("asks") or []
+        if not bids or not asks:
+            return None
+        bid = float(bids[0]["price"])
+        ask = float(asks[0]["price"])
+        if ask <= 0:
+            return None
+        return ((ask - bid) / ask) * 100.0
+    except Exception:
         return None
 
 # =========================
-# HISTORY
+# SCALPER ENTRY LOGIC
 # =========================
 
-history = {}
+def entry_signal(product_id: str) -> Optional[Dict]:
+    data = get_candles_close_vol(product_id, LOOKBACK)
+    if not data:
+        return None
 
-def update_history(product, price):
+    closes, vols = data
 
-    if product not in history:
-        history[product] = []
+    # Momentum: last candle vs previous candle
+    mom_5m = pct_change(closes[-2], closes[-1])
 
-    history[product].append(price)
+    # Basic trend: last 3 candles up bias
+    trend = pct_change(closes[-4], closes[-1])
 
-    if len(history[product]) > 20:
-        history[product].pop(0)
+    # Volume spike: last volume vs avg of prior 10
+    base_vol = sum(vols[-11:-1]) / 10.0 if len(vols) >= 11 else 0.0
+    vol_mult = (vols[-1] / base_vol) if base_vol > 0 else 0.0
 
-def score(product):
+    if mom_5m < MIN_MOMENTUM_PCT_5M:
+        return None
+    if trend < 0:
+        return None
+    if vol_mult < MIN_VOL_SPIKE_MULT:
+        return None
 
-    if product not in history:
-        return 0
+    sp = get_spread_pct(product_id)
+    if sp is None or sp > MAX_SPREAD_PCT:
+        return None
 
-    h = history[product]
+    # Score for ranking
+    score = (mom_5m * 2.0) + (trend * 0.7) + (vol_mult * 0.8) - (sp * 1.5)
 
-    if len(h) < 10:
-        return 0
-
-    recent = statistics.mean(h[-5:])
-    older = statistics.mean(h[:5])
-
-    momentum = (recent - older) / older * 100
-
-    vol = statistics.stdev(h) / recent * 100
-
-    return momentum + vol
+    return {
+        "product_id": product_id,
+        "price": closes[-1],
+        "mom_5m": mom_5m,
+        "trend": trend,
+        "vol_mult": vol_mult,
+        "spread": sp,
+        "score": score
+    }
 
 # =========================
-# TRADING
+# PAPER TRADING
 # =========================
 
-def buy(state, product, price):
-
-    print(f"TRADE: Buying {product}", flush=True)
-
-    if product in state["positions"]:
+def open_position(state: Dict, sig: Dict) -> None:
+    pid = sig["product_id"]
+    if pid in state["positions"]:
+        return
+    if len(state["positions"]) >= MAX_OPEN_POSITIONS:
+        return
+    if cash(state) < QUOTE_PER_TRADE_USD:
         return
 
-    if len(state["positions"]) >= MAX_POSITIONS:
+    entry = float(sig["price"])
+    spend = QUOTE_PER_TRADE_USD
+    net_spend, fee = apply_fee(spend)
+    base = net_spend / entry if entry > 0 else 0.0
+    if base <= 0:
         return
 
-    if state["cash"] < TRADE_SIZE:
-        return
+    state["paper"]["cash"] = cash(state) - spend
+    state["paper"]["fees_paid"] = float(state["paper"]["fees_paid"]) + fee
+    state["paper"]["trades"] = int(state["paper"]["trades"]) + 1
 
-    cost = TRADE_SIZE
-    fee = cost * FEE
-    size = (cost - fee) / price
-
-    state["cash"] -= cost
-
-    state["positions"][product] = {
-        "size": size,
-        "entry": price
+    state["positions"][pid] = {
+        "entry_price": entry,
+        "entry_ts": now_ts(),
+        "base_size": base,
+        "last_price": entry
     }
 
     save_state(state)
 
-    telegram(f"PAPER BUY {product} @ ${price:.4f}")
+    telegram_send(
+        f"<b>PAPER BUY</b> — <b>{pid}</b>\n"
+        f"Entry: <b>${entry:.6g}</b> | Size: <b>{fmt_money(spend)}</b>\n"
+        f"Mom5m: <b>+{sig['mom_5m']:.2f}%</b> | Trend: <b>+{sig['trend']:.2f}%</b>\n"
+        f"Vol: <b>{sig['vol_mult']:.2f}x</b> | Spread: <b>{sig['spread']:.2f}%</b>\n"
+        f"Open: <b>{len(state['positions'])}/{MAX_OPEN_POSITIONS}</b> | Cash: <b>{fmt_money(cash(state))}</b>"
+    )
 
-def sell(state, product, price):
+def close_position(state: Dict, pid: str, price: float, reason: str) -> None:
+    pos = state["positions"].get(pid)
+    if not pos:
+        return
 
-    print(f"TRADE: Selling {product}", flush=True)
+    base = float(pos["base_size"])
+    entry = float(pos["entry_price"])
 
-    pos = state["positions"][product]
+    gross = base * price
+    net, fee = apply_fee(gross)
+    cost = base * entry
+    pnl = net - cost
+    pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
 
-    value = pos["size"] * price
-    fee = value * FEE
-    entry_value = pos["size"] * pos["entry"]
+    state["paper"]["cash"] = cash(state) + net
+    state["paper"]["fees_paid"] = float(state["paper"]["fees_paid"]) + fee
+    state["paper"]["realized_pnl"] = float(state["paper"]["realized_pnl"]) + pnl
+    state["paper"]["trades"] = int(state["paper"]["trades"]) + 1
 
-    pnl = value - fee - entry_value
+    if pnl >= 0:
+        state["paper"]["wins"] = int(state["paper"]["wins"]) + 1
+    else:
+        state["paper"]["losses"] = int(state["paper"]["losses"]) + 1
 
-    state["cash"] += value - fee
-    state["profit"] += pnl
-
-    del state["positions"][product]
+    state["positions"].pop(pid, None)
 
     save_state(state)
 
-    telegram(f"PAPER SELL {product} PnL ${pnl:.2f}")
+    telegram_send(
+        f"<b>PAPER SELL</b> — <b>{pid}</b>\n"
+        f"Reason: <b>{reason}</b>\n"
+        f"Exit: <b>${price:.6g}</b>\n"
+        f"PnL: <b>{fmt_money(pnl)}</b> ({pnl_pct:+.2f}%)\n"
+        f"Open: <b>{len(state['positions'])}/{MAX_OPEN_POSITIONS}</b> | Cash: <b>{fmt_money(cash(state))}</b>"
+    )
 
-def manage(state):
-
-    for product in list(state["positions"].keys()):
-
-        price = get_price(product)
-
-        if not price:
+def manage_positions(state: Dict) -> None:
+    for pid in list(state["positions"].keys()):
+        pos = state["positions"][pid]
+        data = get_candles_close_vol(pid, 8)  # last ~40 minutes
+        if not data:
             continue
+        price = data[0][-1]
+        pos["last_price"] = price
 
-        entry = state["positions"][product]["entry"]
+        entry = float(pos["entry_price"])
+        change = pct_change(entry, price)
 
-        change = (price - entry) / entry * 100
+        age = now_ts() - int(pos["entry_ts"])
 
-        if change >= TAKE_PROFIT or change <= STOP_LOSS:
-
-            sell(state, product, price)
+        if change >= TAKE_PROFIT_PCT:
+            close_position(state, pid, price, f"TP {TAKE_PROFIT_PCT:.2f}%")
+        elif change <= -STOP_LOSS_PCT:
+            close_position(state, pid, price, f"SL {STOP_LOSS_PCT:.2f}%")
+        elif age >= MAX_HOLD_SECONDS:
+            close_position(state, pid, price, f"MAX_HOLD {MAX_HOLD_SECONDS//60}m")
 
 # =========================
 # MAIN
 # =========================
 
 def main():
-
     state = load_state()
 
-    telegram("BOT STARTED")
+    telegram_send(
+        f"<b>SCALPER BOT STARTED</b>\n"
+        f"Mode: <b>{TRADE_MODE.upper()}</b>\n"
+        f"State: <b>{STATE_FILE}</b>\n"
+        f"Cash: <b>{fmt_money(cash(state))}</b>\n"
+        f"Per trade: <b>{fmt_money(QUOTE_PER_TRADE_USD)}</b>\n"
+        f"Max open: <b>{MAX_OPEN_POSITIONS}</b>\n"
+        f"Scan: <b>{SCAN_INTERVAL_SECONDS}s</b>\n"
+        f"TP/SL: <b>+{TAKE_PROFIT_PCT:.2f}%</b> / <b>-{STOP_LOSS_PCT:.2f}%</b>"
+    )
 
-    products = get_products()
-
-    if not products:
-
-        print("ERROR: No products found", flush=True)
-
-        return
-
-    print("BOT: Entering main loop", flush=True)
+    products: List[str] = []
+    last_refresh = 0
 
     while True:
+        try:
+            # Refresh product universe every 30 minutes
+            if not products or (now_ts() - last_refresh) > 1800:
+                products = list_usd_products(MAX_PRODUCTS)
+                last_refresh = now_ts()
+                print(f"[info] products loaded: {len(products)}", flush=True)
 
-        print("SCAN: Running scan cycle...", flush=True)
+            # 1) Manage existing positions (exit first)
+            manage_positions(state)
 
-        manage(state)
+            # 2) Fill open slots with best signals
+            slots = MAX_OPEN_POSITIONS - len(state["positions"])
+            if slots > 0:
+                candidates = []
+                # scan limited universe each cycle for speed
+                for pid in products:
+                    if pid in state["positions"]:
+                        continue
+                    sig = entry_signal(pid)
+                    if sig:
+                        candidates.append(sig)
 
-        best = None
-        best_score = 0
+                candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        for p in products:
+                for sig in candidates[:slots]:
+                    open_position(state, sig)
 
-            price = get_price(p)
+            time.sleep(SCAN_INTERVAL_SECONDS)
 
-            if not price:
-                continue
-
-            update_history(p, price)
-
-            s = score(p)
-
-            if s > best_score:
-
-                best_score = s
-                best = (p, price)
-
-        if best:
-
-            buy(state, best[0], best[1])
-
-        time.sleep(SCAN_INTERVAL)
-
-# =========================
+        except Exception as e:
+            print(f"[error] {type(e).__name__}: {e}", flush=True)
+            time.sleep(max(5, SCAN_INTERVAL_SECONDS))
 
 if __name__ == "__main__":
-
     main()
