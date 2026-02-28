@@ -1,15 +1,38 @@
 # coin_sniper_bot.py
-# Elite Paper (Coinbase public data) + persistent learning + GitHub sync + Telegram alerts
-# - Saves trades (trade_history.csv) and learning state (learning.json)
-# - Persists OPEN positions across restarts (positions.json) so equity/balances stay consistent
-# - Notifies ENTRY/EXIT + per-trade P/L, status (cash/equity/net, winrate, ML on/off)
-# - Uses BOTH: hard stop-loss + trailing stop (max of fixed trailing distance vs ATR-based trail)
+# Elite Paper Trading Bot (Coinbase public data) + Persistent state + OPTIONAL GitHub data sync + Telegram alerts
+#
+# ✅ Fixes included:
+# 1) Prevents “Railway deploy loop” by DEFAULT: will NOT push to a repo that looks like your *code* repo
+#    unless you explicitly allow it (GITHUB_ALLOW_SELF_DEPLOY=1).
+# 2) Boot pull is SAFE: only pulls missing local files (does NOT overwrite local state).
+# 3) Persists OPEN positions across restarts (positions.json) so balances/equity don’t “reset weird”.
+# 4) Equity calc won’t show $0 if Coinbase price fetch fails (falls back to entry price).
+# 5) Never opens $0 trades (hard guard).
+#
+# -------------------------
+# REQUIRED ENV VARS (for Telegram alerts)
+#   TELEGRAM_TOKEN=...
+#   TELEGRAM_CHAT_ID=...
+#
+# OPTIONAL GitHub STATE SYNC (recommended to use a SEPARATE data repo)
+#   GITHUB_TOKEN=ghp_...
+#   GITHUB_REPO=yourusername/coin-sniper-data     <-- IMPORTANT: make this a DATA repo (not the code repo)
+#   GITHUB_BRANCH=main
+#
+# If you *insist* on pushing state into the same repo Railway deploys from:
+#   GITHUB_ALLOW_SELF_DEPLOY=1    (NOT recommended; can cause redeploy loops)
+#
+# OPTIONAL: completely disable GitHub sync
+#   GITHUB_SYNC=0
+#
+# -------------------------
+# Trading settings are env-driven (Railway Variables).
+# This file is PAPER by default unless you later add real-execution code.
 
 import os
 import time
 import json
 import csv
-import math
 import base64
 import traceback
 import requests
@@ -66,7 +89,7 @@ def env_bool(*names: str, default: bool) -> bool:
 
 
 # ============================================================
-# CONFIG (Railway env vars) — canonical names + aliases
+# CONFIG (Railway env vars)
 # ============================================================
 
 # Timing
@@ -91,7 +114,13 @@ MIN_POSITION_SIZE_PERCENT = env_float("MIN_POSITION_SIZE_PERCENT", "MIN_POSITION
 MAX_POSITION_SIZE_PERCENT = env_float("MAX_POSITION_SIZE_PERCENT", "MAX_POSITION_S", default=3.0)
 
 # Stops
-STOP_LOSS_PERCENT = env_float("STOP_LOSS_PERCENT", "STOP_LOSS_PERC", "STOP_LOSS_PERC_", "STOP_LOSS_PERCEN", "STOP_LOSS_PERC_", default=2.8)
+STOP_LOSS_PERCENT = env_float(
+    "STOP_LOSS_PERCENT",
+    "STOP_LOSS_PERC",
+    "STOP_LOSS_PERC_",
+    "STOP_LOSS_PERCEN",
+    default=2.8
+)
 TRAILING_START_PERCENT = env_float("TRAILING_START_PERCENT", "TRAILING_START", default=1.2)
 TRAILING_DISTANCE_PERCENT = env_float(
     "TRAILING_DISTANCE_PERCENT",
@@ -110,7 +139,7 @@ ATR_MULT = env_float("ATR_MULT", default=1.4)
 # Time exits
 MAX_TRADE_DURATION_MINUTES = env_int("MAX_TRADE_DURATION_MINUTES", "MAX_TRADE_DURA", "MAX_TRADE_DUR", default=30)
 
-# Entry strictness (Elite)
+# Entry strictness
 MIN_ENTRY_SCORE = env_float("MIN_ENTRY_SCORE", "MIN_ENTRY_SCOR", default=7.0)
 MIN_TREND_STRENGTH = env_float("MIN_TREND_STRENGTH", "MIN_TREND_STRE", default=0.20)
 MIN_VOLUME_RATIO = env_float("MIN_VOLUME_RATIO", "MIN_VOLUME_RAT", "MIN_VOL_RATIO", default=1.25)
@@ -129,16 +158,18 @@ ML_RETRAIN_EVERY_SEC = env_int("ML_RETRAIN_EVERY_SEC", "ML_RETRAIN_EVE", default
 # Fee estimate
 FEE_PERCENT_PER_SIDE = env_float("FEE_PERCENT_PER_SIDE", "FEE_PERCENT_PE", default=0.20)
 
-# Mode (paper only in this file)
+# Mode
 PAPER_TRADING = env_bool("PAPER_TRADING", default=True)
 
 # Telegram
 TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID") or _env("TELEGRAM_CHAT_")
 
-# GitHub sync (optional)
+# GitHub state sync (optional)
+GITHUB_SYNC = env_bool("GITHUB_SYNC", default=True)  # set to 0 to fully disable
+GITHUB_ALLOW_SELF_DEPLOY = env_bool("GITHUB_ALLOW_SELF_DEPLOY", default=False)
 GITHUB_TOKEN = _env("GITHUB_TOKEN")
-GITHUB_REPO = _env("GITHUB_REPO")          # MUST be like: username/repo
+GITHUB_REPO = _env("GITHUB_REPO")  # should be DATA repo like: joshuadobbs056-ctrl/coin-sniper-data
 GITHUB_BRANCH = _env("GITHUB_BRANCH") or "main"
 
 # Files
@@ -175,8 +206,33 @@ def notify(msg: str) -> None:
 
 
 # ============================================================
-# GitHub Sync (optional)
+# GitHub Sync (optional) — SAFE by default to prevent redeploy loops
 # ============================================================
+
+def _repo_looks_like_code_repo(repo: str) -> bool:
+    """
+    Heuristic: if your repo name looks like the code repo, pushing state there can trigger Railway redeploys.
+    Adjust/extend if you want.
+    """
+    r = (repo or "").lower()
+    # common names you showed
+    if "coinbase-trading-bot" in r:
+        return True
+    if "coin-sniper-bot" in r:
+        return True
+    return False
+
+def github_enabled() -> bool:
+    if not GITHUB_SYNC:
+        return False
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        return False
+
+    # Guard: do NOT push to a code repo unless explicitly allowed.
+    if _repo_looks_like_code_repo(GITHUB_REPO) and not GITHUB_ALLOW_SELF_DEPLOY:
+        return False
+
+    return True
 
 def gh_headers() -> Dict[str, str]:
     return {
@@ -186,7 +242,7 @@ def gh_headers() -> Dict[str, str]:
     }
 
 def gh_get_file(path: str) -> Tuple[Optional[bytes], Optional[str]]:
-    if not (GITHUB_TOKEN and GITHUB_REPO):
+    if not github_enabled():
         return None, None
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     try:
@@ -204,7 +260,7 @@ def gh_get_file(path: str) -> Tuple[Optional[bytes], Optional[str]]:
         return None, None
 
 def gh_put_file(path: str, content_bytes: bytes, message: str) -> None:
-    if not (GITHUB_TOKEN and GITHUB_REPO):
+    if not github_enabled():
         return
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     _, sha = gh_get_file(path)
@@ -222,13 +278,19 @@ def gh_put_file(path: str, content_bytes: bytes, message: str) -> None:
 
 def gh_pull_bootstrap() -> None:
     """
-    Boot-only pull.
-    Rule:
-      - If local file exists, KEEP IT (it is likely newer for your running bot).
+    Boot-only pull:
+      - If local file exists, KEEP IT.
       - If local file missing, pull from GitHub if present.
     """
-    if not (GITHUB_TOKEN and GITHUB_REPO):
+    if not github_enabled():
+        # If disabled because it looks like code repo, explain once.
+        if GITHUB_SYNC and GITHUB_TOKEN and GITHUB_REPO and _repo_looks_like_code_repo(GITHUB_REPO) and not GITHUB_ALLOW_SELF_DEPLOY:
+            notify(
+                "GITHUB SYNC: Disabled push to avoid Railway redeploy loop.\n"
+                "Use a separate data repo for GITHUB_REPO (recommended), or set GITHUB_ALLOW_SELF_DEPLOY=1."
+            )
         return
+
     for fname in (LEARNING_FILE, HISTORY_FILE, POSITIONS_FILE):
         if os.path.exists(fname):
             continue
@@ -243,13 +305,18 @@ def gh_pull_bootstrap() -> None:
 
 _last_gh_push = 0.0
 def gh_push_throttled(reason: str) -> None:
+    """
+    Push state files, throttled so we don't spam GitHub.
+    """
     global _last_gh_push
-    if not (GITHUB_TOKEN and GITHUB_REPO):
+    if not github_enabled():
         return
+
     now = time.time()
-    if now - _last_gh_push < 30:
+    if now - _last_gh_push < 60:  # <= reduce spam (was 30)
         return
     _last_gh_push = now
+
     try:
         for fname in (LEARNING_FILE, HISTORY_FILE, POSITIONS_FILE):
             if os.path.exists(fname):
@@ -266,8 +333,8 @@ def gh_push_throttled(reason: str) -> None:
 
 def load_learning() -> Dict:
     default = {
-        "start_balance": START_BALANCE,
-        "cash": START_BALANCE,
+        "start_balance": float(START_BALANCE),
+        "cash": float(START_BALANCE),
         "trade_count": 0,
         "win_count": 0,
         "loss_count": 0,
@@ -279,6 +346,9 @@ def load_learning() -> Dict:
         with open(LEARNING_FILE, "r") as f:
             data = json.load(f)
 
+        if not isinstance(data, dict):
+            return default
+
         for k, v in default.items():
             if k not in data:
                 data[k] = v
@@ -287,8 +357,14 @@ def load_learning() -> Dict:
         if "total_profit" in data and "total_profit_usd" not in data:
             data["total_profit_usd"] = float(data.get("total_profit", 0.0))
 
-        # If user changed START_BALANCE env, we do NOT overwrite stored start_balance mid-run.
-        # Only set it if it was missing.
+        # sanitize numeric fields
+        data["cash"] = float(data.get("cash", default["cash"]))
+        data["start_balance"] = float(data.get("start_balance", default["start_balance"]))
+        data["trade_count"] = int(data.get("trade_count", 0))
+        data["win_count"] = int(data.get("win_count", 0))
+        data["loss_count"] = int(data.get("loss_count", 0))
+        data["total_profit_usd"] = float(data.get("total_profit_usd", 0.0))
+
         return data
     except Exception:
         return default
@@ -308,12 +384,21 @@ def load_positions() -> Dict[str, Dict]:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}
-        # sanitize
         out: Dict[str, Dict] = {}
         for sym, pos in data.items():
             if not isinstance(pos, dict):
                 continue
-            if "entry" in pos and "qty" in pos and "size" in pos and "time" in pos and "stop" in pos and "peak" in pos:
+            required = ("entry", "qty", "size", "time", "stop", "peak")
+            if all(k in pos for k in required):
+                # sanitize
+                pos["entry"] = float(pos["entry"])
+                pos["qty"] = float(pos["qty"])
+                pos["size"] = float(pos["size"])
+                pos["time"] = float(pos["time"])
+                pos["stop"] = float(pos["stop"])
+                pos["peak"] = float(pos["peak"])
+                if "trail" in pos and pos["trail"] is not None:
+                    pos["trail"] = float(pos["trail"])
                 out[str(sym)] = pos
         return out
     except Exception:
@@ -508,7 +593,7 @@ def build_features(symbol: str) -> Optional[List[float]]:
 
 
 # ============================================================
-# Entry scoring + hard filters
+# Entry scoring + filters
 # ============================================================
 
 def passes_hard_filters(feat: List[float]) -> bool:
@@ -519,7 +604,6 @@ def passes_hard_filters(feat: List[float]) -> bool:
         return False
     if vol_r < 1.05:
         return False
-    # avoid dead / insanely wild
     if atr_p <= 0.0008:
         return False
     if atr_p >= 0.080:
@@ -620,11 +704,14 @@ cash: float = 0.0
 positions: Dict[str, Dict] = {}
 
 def compute_equity(latest_prices: Dict[str, float]) -> float:
+    """
+    If Coinbase price fetch fails, fallback to entry price so equity doesn’t show $0.00.
+    """
     eq = float(cash)
     for sym, pos in positions.items():
         p = latest_prices.get(sym)
         if p is None:
-            continue
+            p = float(pos.get("entry", 0.0))
         eq += float(pos["qty"] * p)
     return float(eq)
 
@@ -652,7 +739,11 @@ def open_trade(sym: str, price: float, feat: List[float], score: float, ml_prob:
         return
 
     size = position_size_usd(score)
-    if size <= 0 or size > cash:
+
+    # HARD guard: never open $0 trades
+    if size is None or size <= 0:
+        return
+    if size > cash:
         return
 
     qty = size / price
@@ -662,18 +753,18 @@ def open_trade(sym: str, price: float, feat: List[float], score: float, ml_prob:
     stop_price = price * (1 - STOP_LOSS_PERCENT / 100.0)
 
     positions[sym] = {
-        "entry": price,
-        "qty": qty,
-        "size": size,
-        "time": time.time(),
-        "peak": price,
-        "stop": stop_price,
+        "entry": float(price),
+        "qty": float(qty),
+        "size": float(size),
+        "time": float(time.time()),
+        "peak": float(price),
+        "stop": float(stop_price),
         "trail": None,
         "features": feat
     }
 
     cash -= size
-    learning["cash"] = cash
+    learning["cash"] = float(cash)
 
     persist_all("buy")
 
@@ -711,11 +802,11 @@ def sell_trade(sym: str, price: float, reason: str, latest_prices: Dict[str, flo
     else:
         learning["loss_count"] = int(learning.get("loss_count", 0)) + 1
     learning["total_profit_usd"] = float(learning.get("total_profit_usd", 0.0)) + float(net_profit_usd)
-    learning["cash"] = cash
+    learning["cash"] = float(cash)
 
     # ML training row uses ENTRY features
     f = pos.get("features") or [50.0, 1.0, 0.0, 0.0, 0.01]
-    append_history([f[0], f[1], f[2], f[3], f[4], float(net_profit_usd)])
+    append_history([float(f[0]), float(f[1]), float(f[2]), float(f[3]), float(f[4]), float(net_profit_usd)])
 
     del positions[sym]
 
@@ -723,7 +814,6 @@ def sell_trade(sym: str, price: float, reason: str, latest_prices: Dict[str, flo
     wins = int(learning.get("win_count", 0))
     losses = int(learning.get("loss_count", 0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
-
     equity = compute_equity(latest_prices)
 
     notify(
@@ -744,18 +834,15 @@ def sell_trade(sym: str, price: float, reason: str, latest_prices: Dict[str, flo
 # Boot sequence
 # ============================================================
 
-# Boot-only GitHub pull (does NOT overwrite local files)
 gh_pull_bootstrap()
-
 ensure_history()
 
 learning = load_learning()
 positions = load_positions()
 
-# IMPORTANT: cash comes from learning.json (so it survives restarts)
 cash = float(learning.get("cash", START_BALANCE))
 
-# Ensure start_balance exists (used for NET calculation)
+# Ensure start_balance exists for NET calc
 if "start_balance" not in learning:
     learning["start_balance"] = float(START_BALANCE)
     save_learning(learning)
@@ -774,8 +861,8 @@ notify(
 last_status_time = time.time()
 train_model_if_ready()
 
-# Persist once at boot so GitHub has the current state
-persist_all("boot")
+# DO NOT auto-push on boot (this can trigger loops in some setups).
+# We only push when actual changes happen (buy/sell/status throttled).
 
 
 # ============================================================
@@ -815,6 +902,7 @@ while True:
         for sym in list(positions.keys()):
             price = latest_prices.get(sym)
             if price is None:
+                # can't manage without a price; skip this loop
                 continue
 
             pos = positions[sym]
@@ -825,7 +913,7 @@ while True:
 
             # peak update
             if price > float(pos["peak"]):
-                pos["peak"] = price
+                pos["peak"] = float(price)
 
             # ATR-based dynamic trailing (uses entry-time ATR% for stability)
             atr_p = float((pos.get("features") or [0, 0, 0, 0, 0])[4] or 0.0)
@@ -841,16 +929,16 @@ while True:
                 continue
 
             # trailing stop
-            if pos["trail"] is not None and price <= float(pos["trail"]):
+            if pos.get("trail") is not None and price <= float(pos["trail"]):
                 sell_trade(sym, price, "TRAIL", latest_prices)
                 continue
 
-            # stagnation exit (time-based)
+            # stagnation exit
             if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
                 sell_trade(sym, price, "STAGNATION", latest_prices)
                 continue
 
-        # Save positions periodically (prevents “weird balance after restart”)
+        # Persist positions periodically so restarts don’t mess your balances
         save_positions(positions)
 
         # ---- ML retrain periodically ----
@@ -913,8 +1001,6 @@ while True:
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
-        # If Railway restarts, it’s usually because the process exited/crashed.
-        # This logs the *real* stack trace into Railway logs + Telegram.
-        tb = traceback.format_exc(limit=6)
+        tb = traceback.format_exc(limit=8)
         notify(f"ERROR: {str(e)}\n{tb}")
         time.sleep(10)
