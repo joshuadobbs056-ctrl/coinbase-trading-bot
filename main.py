@@ -59,26 +59,22 @@ def notify(msg):
 #########################################
 
 def load_learning():
-    if os.path.exists(LEARNING_FILE):
-        with open(LEARNING_FILE,"r") as f:
-            data = json.load(f)
-    else:
-        data = {}
+    data = {}
 
-    if "trade_count" not in data:
-        data["trade_count"] = 0
-    if "win_count" not in data:
-        data["win_count"] = 0
-    if "loss_count" not in data:
-        data["loss_count"] = 0
-    if "total_profit" not in data:
-        data["total_profit"] = 0.0
+    if os.path.exists(LEARNING_FILE):
+        with open(LEARNING_FILE, "r") as f:
+            data = json.load(f)
+
+    data.setdefault("trade_count", 0)
+    data.setdefault("win_count", 0)
+    data.setdefault("loss_count", 0)
+    data.setdefault("total_profit", 0.0)
 
     return data
 
 def save_learning():
-    with open(LEARNING_FILE,"w") as f:
-        json.dump(learning,f)
+    with open(LEARNING_FILE, "w") as f:
+        json.dump(learning, f)
 
 learning = load_learning()
 
@@ -87,9 +83,9 @@ learning = load_learning()
 #########################################
 
 if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE,"w",newline="") as f:
+    with open(HISTORY_FILE, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["rsi","volume_ratio","trend_strength","momentum","profit"])
+        writer.writerow(["rsi", "volume_ratio", "trend_strength", "momentum", "profit"])
 
 #########################################
 # ML MODEL
@@ -103,14 +99,14 @@ def train_model():
     try:
         data = np.loadtxt(HISTORY_FILE, delimiter=",", skiprows=1)
 
-        if len(data.shape) == 1:
+        if data.shape[0] < 50:
             return
 
-        X = data[:,0:4]
-        y = data[:,4] > 0
+        X = data[:, 0:4]
+        y = data[:, 4] > 0
 
         model = RandomForestClassifier(n_estimators=200)
-        model.fit(X,y)
+        model.fit(X, y)
 
         notify("ML MODEL ACTIVATED")
 
@@ -126,22 +122,32 @@ def get_symbols():
         r = requests.get(BASE_URL + "/products", timeout=10)
         data = r.json()
 
-        usd = [p["id"] for p in data if "-USD" in p["id"]]
+        symbols = [
+            p["id"]
+            for p in data
+            if "-USD" in p["id"]
+            and p.get("status") == "online"
+        ]
 
-        return usd[:MAX_SYMBOLS]
+        return symbols[:MAX_SYMBOLS]
 
     except:
-        return ["BTC-USD","ETH-USD"]
+        return ["BTC-USD", "ETH-USD"]
 
 def get_ticker(sym):
     try:
         r = requests.get(BASE_URL + f"/products/{sym}/ticker", timeout=10)
         data = r.json()
 
-        if "price" in data:
-            return float(data["price"])
+        if "price" not in data:
+            return None
 
-        return None
+        price = float(data["price"])
+
+        if price <= 0:
+            return None
+
+        return price
 
     except:
         return None
@@ -150,11 +156,15 @@ def get_candles(sym):
     try:
         r = requests.get(
             BASE_URL + f"/products/{sym}/candles",
-            params={"granularity":60},
+            params={"granularity": 60},
             timeout=10
         )
 
         data = r.json()
+
+        if not isinstance(data, list) or len(data) < 20:
+            return None
+
         data.reverse()
 
         return data[-60:]
@@ -171,8 +181,8 @@ def calc_rsi(closes):
         return 50
 
     deltas = np.diff(closes)
-    gains = np.maximum(deltas,0)
-    losses = -np.minimum(deltas,0)
+    gains = np.maximum(deltas, 0)
+    losses = -np.minimum(deltas, 0)
 
     avg_gain = np.mean(gains[-14:])
     avg_loss = np.mean(losses[-14:])
@@ -180,17 +190,23 @@ def calc_rsi(closes):
     if avg_loss == 0:
         return 100
 
-    rs = avg_gain/avg_loss
-
-    return 100 - (100/(1+rs))
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 def trend_strength(closes):
-    return (closes[-1] - np.mean(closes)) / np.mean(closes)
+    avg = np.mean(closes)
+    if avg == 0:
+        return 0
+    return (closes[-1] - avg) / avg
 
 def momentum(closes):
+    if len(closes) < 6:
+        return 0
     return (closes[-1] - closes[-5]) / closes[-5]
 
 def volume_ratio(vols):
+    if len(vols) < 20:
+        return 1
     return vols[-1] / np.mean(vols[-20:])
 
 #########################################
@@ -205,24 +221,22 @@ open_trades = []
 #########################################
 
 def position_size():
-
     percent = MIN_POSITION_SIZE_PERCENT
 
     if learning["trade_count"] > 50:
         percent = MAX_POSITION_SIZE_PERCENT
 
-    return cash * percent / 100
+    size = cash * percent / 100
+
+    return min(size, cash)
 
 #########################################
-# RECORD TRADE (ML LEARNING)
+# RECORD TRADE
 #########################################
 
 def record_trade(t, profit):
-
-    with open(HISTORY_FILE,"a",newline="") as f:
-
+    with open(HISTORY_FILE, "a", newline="") as f:
         writer = csv.writer(f)
-
         writer.writerow([
             t["rsi"],
             t["volume_ratio"],
@@ -276,6 +290,9 @@ def open_trade(sym, price, features):
 
     global cash
 
+    if sym not in prices:
+        return
+
     if len(open_trades) >= MAX_OPEN_TRADES:
         return
 
@@ -285,7 +302,6 @@ def open_trade(sym, price, features):
         return
 
     qty = size / price
-
     cash -= size
 
     trade = {
@@ -294,7 +310,7 @@ def open_trade(sym, price, features):
         "qty": qty,
         "time": time.time(),
         "peak": price,
-        "stop": price * (1 - STOP_LOSS_PERCENT/100),
+        "stop": price * (1 - STOP_LOSS_PERCENT / 100),
         "trail": None,
         **features
     }
@@ -307,7 +323,7 @@ def open_trade(sym, price, features):
 # MANAGE TRADES
 #########################################
 
-def manage_trades(prices):
+def manage_trades():
 
     global open_trades
 
@@ -315,16 +331,19 @@ def manage_trades(prices):
 
     for t in open_trades:
 
-        if t["sym"] not in prices:
+        sym = t["sym"]
+
+        if sym not in prices:
+            remaining.append(t)
             continue
 
-        price = prices[t["sym"]]
+        price = prices[sym]
 
         if price > t["peak"]:
             t["peak"] = price
 
-        if price >= t["entry"] * (1 + TRAILING_START_PERCENT/100):
-            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT/100)
+        if price >= t["entry"] * (1 + TRAILING_START_PERCENT / 100):
+            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT / 100)
 
         age_min = (time.time() - t["time"]) / 60
         profit_pct = (price - t["entry"]) / t["entry"] * 100
@@ -346,7 +365,7 @@ def manage_trades(prices):
     open_trades = remaining
 
 #########################################
-# MAIN LOOP
+# START
 #########################################
 
 notify("BOT STARTED")
@@ -363,22 +382,24 @@ while True:
         prices = {}
 
         for sym in symbols:
-
             price = get_ticker(sym)
 
-            if price:
+            if price is not None:
                 prices[sym] = price
 
-        manage_trades(prices)
+        manage_trades()
 
         for sym in symbols:
+
+            if sym not in prices:
+                continue
 
             if sym in [t["sym"] for t in open_trades]:
                 continue
 
             candles = get_candles(sym)
 
-            if not candles:
+            if candles is None:
                 continue
 
             closes = [c[4] for c in candles]
