@@ -9,582 +9,694 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
-# ==========================================================
-# VARIABLES (Railway)
-# ==========================================================
+# =========================
+# CONFIG (Railway env vars)
+# =========================
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 8))
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
 
-COINS = os.getenv("COINS", "AUTO").replace(" ", "")
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 200))
+# Universe
+COINS = os.getenv("COINS", "AUTO").strip()
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 120))  # keep sane or you will rate-limit yourself
+EXCLUDE = set([s.strip().upper() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
+
+# Risk / exposure
+START_BALANCE = float(os.getenv("START_BALANCE", 1000))
+CASH_RESERVE_PERCENT = float(os.getenv("CASH_RESERVE_PERCENT", 5.0))
+
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
-
-START_BALANCE = float(os.getenv("START_BALANCE", 500))
-
-# Position sizing
 MIN_TRADE_SIZE_USD = float(os.getenv("MIN_TRADE_SIZE_USD", 25))
-MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 5))
-MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 10))
-MIN_CASH_RESERVE_PERCENT = float(os.getenv("MIN_CASH_RESERVE_PERCENT", 15))
 
-# Risk / exits
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 2.5))
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.9))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.5))
-MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 60))
+MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 1.0))
+MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 3.0))
 
-# Fee-aware exit floor (prevents tiny "wins" getting eaten)
-MIN_PROFIT_TO_SELL_PERCENT = float(os.getenv("MIN_PROFIT_TO_SELL_PERCENT", 0.35))
+# Stops
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 2.0))
+TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.8))
+TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.6))
 
-# Trend continuation entry thresholds
-RSI_MIN = float(os.getenv("RSI_MIN", 55))
+# Trailing distance can be widened dynamically using ATR
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", 14))
+ATR_MULT = float(os.getenv("ATR_MULT", 1.2))  # higher = wider trailing
+
+# Time exits
+MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 25))
+
+# Entry strictness (Elite)
+MIN_ENTRY_SCORE = float(os.getenv("MIN_ENTRY_SCORE", 7.0))  # 0..10 scale
+MIN_TREND_STRENGTH = float(os.getenv("MIN_TREND_STRENGTH", 0.20))  # EMA slope threshold
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", 1.25))
+RSI_MIN = float(os.getenv("RSI_MIN", 52))
 RSI_MAX = float(os.getenv("RSI_MAX", 72))
-MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", 1.15))
-MIN_MOMENTUM = float(os.getenv("MIN_MOMENTUM", 0.002))  # 0.2% over lookback
-MIN_TREND_STRENGTH = float(os.getenv("MIN_TREND_STRENGTH", 0.0))
 
 # Candles
-CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", 60))  # 60s candles
-CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", 60))            # last N candles
+CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", 60))  # 60, 300, 900, 3600...
+CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", 120))          # enough history for EMA/ATR
 
 # ML
-ML_MIN_TRADES_TO_ENABLE = int(os.getenv("ML_MIN_TRADES_TO_ENABLE", 50))
+ML_MIN_TRADES_TO_ENABLE = int(os.getenv("ML_MIN_TRADES_TO_ENABLE", 75))
 ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", 0.60))
-ML_RETRAIN_EVERY_TRADES = int(os.getenv("ML_RETRAIN_EVERY_TRADES", 25))
+ML_RETRAIN_EVERY_SEC = int(os.getenv("ML_RETRAIN_EVERY_SEC", 600))
+
+# Fees (paper estimate). Set to your expected round-trip fee/impact.
+FEE_PERCENT_PER_SIDE = float(os.getenv("FEE_PERCENT_PER_SIDE", 0.20))  # 0.20% per side default
 
 # Telegram (optional)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Paper trading toggle (this bot is PAPER by design)
+# Mode
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
-# Coinbase Exchange API base
-BASE_URL = "https://api.exchange.coinbase.com"
-
-# Files (local container). NOTE: if Railway restarts without persistent storage, these reset.
+# Files
 LEARNING_FILE = "learning.json"
 HISTORY_FILE = "trade_history.csv"
-STATE_FILE = "state.json"
 
-# ==========================================================
-# Telegram
-# ==========================================================
+# Coinbase endpoints
+BASE_URL = "https://api.exchange.coinbase.com"
+PRODUCTS_URL = f"{BASE_URL}/products"
+TICKER_URL = f"{BASE_URL}/products/{{}}/ticker"
+CANDLES_URL = f"{BASE_URL}/products/{{}}/candles"
 
-def send_telegram(msg: str) -> None:
+# =========================
+# UTIL / LOGGING
+# =========================
+
+session = requests.Session()
+session.headers.update({"User-Agent": "coin-sniper/elite"})
+
+def notify(msg: str) -> None:
     print(msg, flush=True)
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        requests.post(
+        session.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
+            timeout=10
         )
     except Exception:
         pass
 
-# ==========================================================
-# Persistence (local files)
-# ==========================================================
+# =========================
+# LEARNING STATE (persistent)
+# =========================
 
-def load_json(path: str, default: dict) -> dict:
+def load_learning() -> Dict:
+    default = {
+        "cash": START_BALANCE,
+        "trade_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "total_profit_usd": 0.0
+    }
+    if not os.path.exists(LEARNING_FILE):
+        return default
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
+        with open(LEARNING_FILE, "r") as f:
+            data = json.load(f)
+        # Patch fields so upgrades don't crash
+        for k, v in default.items():
+            if k not in data:
+                data[k] = v
+        # Backward compat
+        if "total_profit" in data and "total_profit_usd" not in data:
+            data["total_profit_usd"] = float(data.get("total_profit", 0.0))
+        return data
+    except Exception:
+        return default
+
+def save_learning(state: Dict) -> None:
+    try:
+        with open(LEARNING_FILE, "w") as f:
+            json.dump(state, f)
     except Exception:
         pass
-    return default
 
-def save_json(path: str, data: dict) -> None:
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+learning = load_learning()
+cash = float(learning["cash"])
 
-def ensure_history_file() -> None:
+# =========================
+# HISTORY FILE for ML
+# =========================
+
+def ensure_history():
     if os.path.exists(HISTORY_FILE):
         return
     try:
         with open(HISTORY_FILE, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["rsi", "volume_ratio", "trend_strength", "momentum", "profit"])
+            w.writerow(["rsi", "volume_ratio", "trend_strength", "momentum", "atr_pct", "profit_usd"])
     except Exception:
         pass
 
-ensure_history_file()
-
-learning = load_json(LEARNING_FILE, {
-    "trade_count": 0,
-    "win_count": 0,
-    "loss_count": 0,
-    "total_profit_usd": 0.0,  # realized P/L in USD for paper
-})
-
-state = load_json(STATE_FILE, {
-    "cash": START_BALANCE,
-})
-
-cash = float(state.get("cash", START_BALANCE))
-
-# ==========================================================
-# Coinbase data
-# ==========================================================
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "coin-sniper-bot"})
-
-def cb_get_products_usd() -> List[str]:
+def append_history(row: List[float]) -> None:
     try:
-        r = SESSION.get(f"{BASE_URL}/products", timeout=15)
+        with open(HISTORY_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(row)
+    except Exception:
+        pass
+
+ensure_history()
+
+# =========================
+# MARKET DATA
+# =========================
+
+def get_symbols_auto() -> List[str]:
+    try:
+        r = session.get(PRODUCTS_URL, timeout=15)
         if r.status_code != 200:
             return []
         data = r.json()
-        symbols = []
-        for p in data:
-            try:
-                if p.get("quote_currency") == "USD" and p.get("status") == "online":
-                    symbols.append(p["id"])
-            except Exception:
+        out = []
+        for d in data:
+            pid = d.get("id", "")
+            if not pid or pid.upper() in EXCLUDE:
                 continue
-        return symbols
+            # USD quote pairs only
+            if d.get("quote_currency") != "USD":
+                continue
+            # Skip obvious stables / weirds if you want
+            if pid.startswith("USD-") or pid.endswith("-USDT") or pid.endswith("-USDC"):
+                continue
+            out.append(pid)
+        return out[:MAX_SYMBOLS]
     except Exception:
         return []
 
-def cb_get_price(symbol: str) -> Optional[float]:
-    # Ticker sometimes doesn't include "price" for some products or when rate-limited.
+def get_symbols() -> List[str]:
+    if COINS.upper() == "AUTO":
+        return get_symbols_auto()
+    coins = [c.strip() for c in COINS.split(",") if c.strip()]
+    coins = [c for c in coins if c.upper() not in EXCLUDE]
+    return coins[:MAX_SYMBOLS]
+
+def get_ticker(symbol: str) -> Optional[Dict]:
     try:
-        r = SESSION.get(f"{BASE_URL}/products/{symbol}/ticker", timeout=10)
+        r = session.get(TICKER_URL.format(symbol), timeout=10)
         if r.status_code != 200:
             return None
-        data = r.json()
-        p = data.get("price")
-        if p is None:
-            return None
+        return r.json()
+    except Exception:
+        return None
+
+def get_price(symbol: str) -> Optional[float]:
+    t = get_ticker(symbol)
+    if not t:
+        return None
+    p = t.get("price")
+    if p is None:
+        return None
+    try:
         return float(p)
     except Exception:
         return None
 
-def cb_get_candles(symbol: str, granularity: int, points: int) -> Optional[List[List[float]]]:
+def get_candles(symbol: str, granularity: int, points: int) -> Optional[List[List[float]]]:
+    # response: [ time, low, high, open, close, volume ]
     try:
-        r = SESSION.get(
-            f"{BASE_URL}/products/{symbol}/candles",
+        r = session.get(
+            CANDLES_URL.format(symbol),
             params={"granularity": str(granularity)},
-            timeout=15,
+            timeout=12
         )
         if r.status_code != 200:
             return None
         data = r.json()
-        if not isinstance(data, list) or len(data) < 30:
+        if not isinstance(data, list) or len(data) < 25:
             return None
-        # newest-first -> oldest-first
-        data = list(reversed(data))
+        data = list(reversed(data))  # oldest -> newest
         return data[-min(points, len(data)):]
     except Exception:
         return None
 
-# ==========================================================
-# Indicators
-# ==========================================================
+# =========================
+# INDICATORS
+# =========================
 
-def ema(values: np.ndarray, period: int = 20) -> float:
-    if len(values) == 0:
-        return 0.0
-    if len(values) < period:
-        return float(np.mean(values))
-    k = 2 / (period + 1)
-    e = float(values[0])
-    for v in values[1:]:
-        e = float(v) * k + e * (1 - k)
+def ema(arr: np.ndarray, period: int) -> float:
+    if len(arr) < period:
+        return float(np.mean(arr)) if len(arr) else 0.0
+    k = 2.0 / (period + 1.0)
+    e = float(arr[0])
+    for v in arr[1:]:
+        e = float(v) * k + e * (1.0 - k)
     return float(e)
 
-def rsi14(closes: np.ndarray) -> float:
-    if len(closes) < 15:
+def calc_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
         return 50.0
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = float(np.mean(gains[-14:]))
-    avg_loss = float(np.mean(losses[-14:]))
+    a = np.array(closes, dtype=float)
+    d = np.diff(a)
+    gains = np.where(d > 0, d, 0.0)
+    losses = np.where(d < 0, -d, 0.0)
+    avg_gain = float(np.mean(gains[-period:]))
+    avg_loss = float(np.mean(losses[-period:]))
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
     return float(100.0 - (100.0 / (1.0 + rs)))
 
-def volume_ratio(vols: np.ndarray, period: int = 20) -> float:
+def momentum(closes: List[float], lookback: int = 5) -> float:
+    if len(closes) < lookback + 1:
+        return 0.0
+    prev = closes[-1 - lookback]
+    if prev == 0:
+        return 0.0
+    return float((closes[-1] - prev) / prev)
+
+def volume_ratio(vols: List[float], period: int = 20) -> float:
     if len(vols) < 2:
         return 1.0
-    n = min(period, len(vols))
-    avg = float(np.mean(vols[-n:]))
+    p = min(period, len(vols))
+    avg = float(np.mean(vols[-p:]))
     if avg <= 0:
         return 1.0
     return float(vols[-1] / avg)
 
-def momentum(closes: np.ndarray, lookback: int = 5) -> float:
-    if len(closes) < lookback + 1:
+def atr_percent(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
         return 0.0
-    base = float(closes[-1 - lookback])
-    if base <= 0:
+    h = np.array(highs, dtype=float)
+    l = np.array(lows, dtype=float)
+    c = np.array(closes, dtype=float)
+    prev_close = c[:-1]
+    tr = np.maximum(h[1:] - l[1:], np.maximum(np.abs(h[1:] - prev_close), np.abs(l[1:] - prev_close)))
+    atr = float(np.mean(tr[-period:]))
+    last_close = float(c[-1])
+    if last_close <= 0:
         return 0.0
-    return float((closes[-1] - base) / base)
+    return float(atr / last_close)
 
-def trend_strength(closes: np.ndarray) -> float:
-    if len(closes) < 20:
+def trend_strength(closes: List[float]) -> float:
+    # EMA fast/slow + slope gives “continuation” signal
+    if len(closes) < 60:
         return 0.0
-    e = ema(closes, 20)
-    if e <= 0:
+    arr = np.array(closes, dtype=float)
+    ema_fast = ema(arr[-50:], 20)
+    ema_slow = ema(arr[-60:], 50)
+    if ema_slow <= 0:
         return 0.0
-    return float((closes[-1] - e) / e)
+    # strength: fast above slow
+    spread = (ema_fast - ema_slow) / ema_slow
+    # slope: fast EMA rising (compare last vs 10 bars ago)
+    ema_fast_10ago = ema(arr[-60:-10], 20)
+    slope = (ema_fast - ema_fast_10ago) / ema_slow
+    return float(spread + slope)
 
-def build_features(symbol: str) -> Optional[Tuple[List[float], float]]:
-    candles = cb_get_candles(symbol, CANDLE_GRANULARITY, CANDLE_POINTS)
-    if candles is None or len(candles) < 30:
+def build_features(symbol: str) -> Optional[Tuple[List[float], Dict[str, float]]]:
+    candles = get_candles(symbol, CANDLE_GRANULARITY, CANDLE_POINTS)
+    if not candles:
         return None
 
-    closes = np.array([float(c[4]) for c in candles], dtype=float)
-    vols = np.array([float(c[5]) for c in candles], dtype=float)
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows  = [float(c[1]) for c in candles]
+    vols  = [float(c[5]) for c in candles]
 
-    r = rsi14(closes)
-    vr = volume_ratio(vols, 20)
-    ts = trend_strength(closes)
-    mom = momentum(closes, 5)
-    last = float(closes[-1])
+    rsi_v = calc_rsi(closes, 14)
+    vol_r = volume_ratio(vols, 20)
+    trend_v = trend_strength(closes)
+    mom_v = momentum(closes, 5)
+    atr_p = atr_percent(highs, lows, closes, ATR_PERIOD)
 
-    feats = [float(r), float(vr), float(ts), float(mom)]
-    return feats, last
+    features = [float(rsi_v), float(vol_r), float(trend_v), float(mom_v), float(atr_p)]
+    info = {"last_close": float(closes[-1])}
+    return features, info
 
-# ==========================================================
-# ML (Real training on real features)
-# ==========================================================
+# =========================
+# ELITE ENTRY SCORING
+# =========================
+
+def entry_score(feat: List[float]) -> float:
+    # 0..10-ish scoring
+    rsi_v, vol_r, trend_v, mom_v, atr_p = feat
+
+    score = 0.0
+
+    # Trend continuation: trend_v must be positive and strong
+    if trend_v > MIN_TREND_STRENGTH:
+        score += 4.0
+    elif trend_v > 0:
+        score += 2.0
+
+    # Momentum: positive continuation
+    if mom_v > 0.002:
+        score += 2.0
+    elif mom_v > 0:
+        score += 1.0
+
+    # Volume confirmation
+    if vol_r >= MIN_VOLUME_RATIO:
+        score += 2.5
+    elif vol_r >= 1.10:
+        score += 1.5
+
+    # RSI in bullish-but-not-overheated zone
+    if RSI_MIN <= rsi_v <= RSI_MAX:
+        score += 1.5
+    elif 50 <= rsi_v < RSI_MIN:
+        score += 0.75
+
+    # ATR too huge = noisy; too tiny = dead
+    if 0.002 <= atr_p <= 0.030:
+        score += 0.5
+
+    return float(score)
+
+def passes_hard_filters(feat: List[float]) -> bool:
+    rsi_v, vol_r, trend_v, mom_v, atr_p = feat
+    if vol_r < 1.05:
+        return False
+    if trend_v <= 0:
+        return False
+    if mom_v <= 0:
+        return False
+    # avoid extremely dead or extremely wild coins
+    if atr_p <= 0.0008:
+        return False
+    if atr_p >= 0.060:
+        return False
+    return True
+
+# =========================
+# ML FILTER
+# =========================
 
 model: Optional[RandomForestClassifier] = None
-
-def load_history_matrix() -> Optional[np.ndarray]:
-    try:
-        data = np.loadtxt(HISTORY_FILE, delimiter=",", skiprows=1)
-        if data.size == 0:
-            return None
-        if data.ndim == 1:
-            data = np.expand_dims(data, axis=0)
-        return data
-    except Exception:
-        return None
+last_train = 0
 
 def train_model_if_ready() -> None:
-    global model
-    data = load_history_matrix()
-    if data is None or len(data) < ML_MIN_TRADES_TO_ENABLE:
+    global model, last_train
+    now = time.time()
+    if now - last_train < ML_RETRAIN_EVERY_SEC:
+        return
+    last_train = now
+
+    if not os.path.exists(HISTORY_FILE):
         model = None
         return
+
     try:
+        data = np.genfromtxt(HISTORY_FILE, delimiter=",", skip_header=1)
+        if data is None or (hasattr(data, "size") and data.size == 0):
+            model = None
+            return
+
+        if data.ndim == 1:
+            data = np.expand_dims(data, axis=0)
+
+        if len(data) < ML_MIN_TRADES_TO_ENABLE:
+            model = None
+            return
+
         X = data[:, :-1]
-        y = (data[:, -1] > 0).astype(int)
-        m = RandomForestClassifier(n_estimators=200, random_state=42)
+        y = (data[:, -1] > 0).astype(int)  # profit_usd > 0
+
+        m = RandomForestClassifier(
+            n_estimators=300,
+            random_state=42,
+            max_depth=6,
+            min_samples_leaf=4
+        )
         m.fit(X, y)
         model = m
-        send_telegram(f"ML MODEL ON ({len(data)} trades)")
+        notify(f"ML MODEL ACTIVATED ({len(data)} trades)")
     except Exception:
         model = None
 
-def ml_allows(features: List[float]) -> bool:
+def ml_allows(feat: List[float]) -> Tuple[bool, float]:
     if model is None:
-        return True
+        return True, 0.0
     try:
-        prob = float(model.predict_proba([features])[0][1])
-        return prob >= ML_MIN_PROB
+        prob = float(model.predict_proba([feat])[0][1])
+        return prob >= ML_MIN_PROB, prob
     except Exception:
-        return True
+        return True, 0.0
 
-# ==========================================================
-# Portfolio / Trading (PAPER)
-# ==========================================================
+# =========================
+# PORTFOLIO / EXECUTION (paper)
+# =========================
 
-open_trades: List[Dict] = []
+positions: Dict[str, Dict] = {}
 
 def cash_reserve_amount() -> float:
-    return cash * (MIN_CASH_RESERVE_PERCENT / 100.0)
+    return float(cash * (CASH_RESERVE_PERCENT / 100.0))
 
-def can_open_more() -> bool:
-    return len(open_trades) < MAX_OPEN_TRADES
-
-def already_open(symbol: str) -> bool:
-    return any(t["symbol"] == symbol for t in open_trades)
-
-def next_position_size_usd() -> float:
-    # Random within percent range, but enforces MIN_TRADE_SIZE_USD and reserve cash.
-    available = max(0.0, cash - cash_reserve_amount())
-    if available <= 0:
-        return 0.0
-
-    pct = float(np.random.uniform(MIN_POSITION_SIZE_PERCENT, MAX_POSITION_SIZE_PERCENT))
-    raw = cash * (pct / 100.0)
-    size = max(raw, MIN_TRADE_SIZE_USD)
-    return float(min(size, available))
-
-def calculate_equity(latest_prices: Dict[str, float]) -> float:
-    eq = cash
-    for t in open_trades:
-        p = latest_prices.get(t["symbol"])
+def compute_equity(latest_prices: Dict[str, float]) -> float:
+    eq = float(cash)
+    for sym, pos in positions.items():
+        p = latest_prices.get(sym)
         if p is None:
             continue
-        eq += t["qty"] * p
+        eq += float(pos["qty"] * p)
     return float(eq)
 
-def append_trade_history(features: List[float], profit_usd: float) -> None:
-    try:
-        with open(HISTORY_FILE, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([features[0], features[1], features[2], features[3], profit_usd])
-    except Exception:
-        pass
+def position_size_usd(score: float) -> float:
+    # scale size with score: MIN% .. MAX%
+    pct = MIN_POSITION_SIZE_PERCENT + (max(0.0, min(10.0, score)) / 10.0) * (MAX_POSITION_SIZE_PERCENT - MIN_POSITION_SIZE_PERCENT)
+    raw = cash * (pct / 100.0)
+    # enforce min trade size
+    size = max(MIN_TRADE_SIZE_USD, raw)
+    # keep reserve
+    available = max(0.0, cash - cash_reserve_amount())
+    return float(min(size, available))
 
-def save_state_now() -> None:
-    save_json(LEARNING_FILE, learning)
-    save_json(STATE_FILE, {"cash": cash})
-
-def open_trade(symbol: str, price: float, features: List[float]) -> None:
+def open_trade(sym: str, price: float, feat: List[float], score: float, ml_prob: float) -> None:
     global cash
-    if not PAPER_TRADING:
-        # This bot is paper-only (no authenticated trading here).
+    if sym in positions:
+        return
+    if len(positions) >= MAX_OPEN_TRADES:
         return
 
-    if not can_open_more() or already_open(symbol):
-        return
-
-    size = next_position_size_usd()
-    if size <= 0:
+    size = position_size_usd(score)
+    if size <= 0 or size > cash:
         return
 
     qty = size / price
     if qty <= 0:
         return
 
-    cash -= size
+    # Hard stop
+    stop_price = price * (1 - STOP_LOSS_PERCENT / 100.0)
 
-    trade = {
-        "symbol": symbol,
-        "qty": qty,
+    positions[sym] = {
         "entry": price,
+        "qty": qty,
+        "size": size,
         "time": time.time(),
         "peak": price,
+        "stop": stop_price,
         "trail": None,
-        "stop": price * (1 - STOP_LOSS_PERCENT / 100.0),
-        "features": features,  # REAL features saved for ML
+        "features": feat
     }
-    open_trades.append(trade)
 
-    send_telegram(
-        f"BUY {symbol}\n"
+    cash -= size
+    learning["cash"] = cash
+    save_learning(learning)
+
+    notify(
+        f"BUY {sym}\n"
         f"Price: {price:.6f}\n"
         f"Size: ${size:.2f}\n"
-        f"Stop: {trade['stop']:.6f}\n"
-        f"Cash: ${cash:.2f}\n"
-        f"ML: {'ON' if model is not None else 'OFF'}"
+        f"Score: {score:.2f} | ML: {ml_prob:.2f}\n"
+        f"Cash: ${cash:.2f}"
     )
-    save_state_now()
 
-def close_trade(trade: Dict, exit_price: float, reason: str) -> None:
+def sell_trade(sym: str, price: float, reason: str, latest_prices: Dict[str, float]) -> None:
     global cash
 
-    proceeds = trade["qty"] * exit_price
-    cost = trade["qty"] * trade["entry"]
-    profit_usd = proceeds - cost
+    pos = positions.get(sym)
+    if not pos:
+        return
+
+    entry = float(pos["entry"])
+    qty = float(pos["qty"])
+    size = float(pos["size"])
+
+    proceeds = qty * price
+    gross_profit_usd = proceeds - size
+
+    # Fee estimate (both sides) on notional
+    fee_entry = size * (FEE_PERCENT_PER_SIDE / 100.0)
+    fee_exit = proceeds * (FEE_PERCENT_PER_SIDE / 100.0)
+    net_profit_usd = gross_profit_usd - fee_entry - fee_exit
 
     cash += proceeds
 
     learning["trade_count"] += 1
-    if profit_usd > 0:
+    if net_profit_usd > 0:
         learning["win_count"] += 1
     else:
         learning["loss_count"] += 1
-    learning["total_profit_usd"] += float(profit_usd)
+    learning["total_profit_usd"] += float(net_profit_usd)
+    learning["cash"] = cash
+    save_learning(learning)
 
-    append_trade_history(trade["features"], float(profit_usd))
+    # Save ML row using REAL features from entry time
+    f = pos.get("features") or [50.0, 1.0, 0.0, 0.0, 0.01]
+    append_history([f[0], f[1], f[2], f[3], f[4], float(net_profit_usd)])
 
-    # Retrain periodically (keeps ML improving)
-    if learning["trade_count"] % max(1, ML_RETRAIN_EVERY_TRADES) == 0:
-        train_model_if_ready()
+    del positions[sym]
 
+    trades = int(learning["trade_count"])
     wins = int(learning["win_count"])
     losses = int(learning["loss_count"])
-    total = int(learning["trade_count"])
-    winrate = (wins / total * 100.0) if total > 0 else 0.0
+    winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
-    send_telegram(
-        f"SELL {trade['symbol']} ({reason})\n"
-        f"Entry: {trade['entry']:.6f}\n"
-        f"Exit:  {exit_price:.6f}\n"
-        f"P/L:   ${profit_usd:.2f}\n"
-        f"Cash:  ${cash:.2f}\n"
-        f"Trades: {total} | W: {wins} | L: {losses} | WR: {winrate:.1f}%"
-    )
-
-    save_state_now()
-
-def manage_open_trades(latest_prices: Dict[str, float]) -> None:
-    global open_trades
-
-    remaining = []
-
-    for t in open_trades:
-        price = latest_prices.get(t["symbol"])
-        if price is None:
-            remaining.append(t)
-            continue
-
-        # Update peak
-        if price > t["peak"]:
-            t["peak"] = price
-
-        # Profit percent relative to entry
-        profit_pct = (price - t["entry"]) / t["entry"] * 100.0
-
-        # Activate/update trailing once profit >= start
-        if profit_pct >= TRAILING_START_PERCENT:
-            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT / 100.0)
-
-        age_min = (time.time() - t["time"]) / 60.0
-
-        # STOP
-        if price <= t["stop"]:
-            close_trade(t, price, "STOP")
-            continue
-
-        # TRAIL (fee-aware floor)
-        if t["trail"] is not None and price <= t["trail"] and profit_pct >= MIN_PROFIT_TO_SELL_PERCENT:
-            close_trade(t, price, "TRAIL")
-            continue
-
-        # STAGNATION (your exact requested logic)
-        if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
-            close_trade(t, price, "STAGNATION")
-            continue
-
-        remaining.append(t)
-
-    open_trades = remaining
-
-# ==========================================================
-# Trend Continuation Entry Filter
-# ==========================================================
-
-def trend_continuation_ok(features: List[float]) -> bool:
-    rsi_v, vol_r, ts, mom = features
-    return (
-        (RSI_MIN <= rsi_v <= RSI_MAX) and
-        (vol_r >= MIN_VOL_RATIO) and
-        (mom >= MIN_MOMENTUM) and
-        (ts >= MIN_TREND_STRENGTH)
-    )
-
-# ==========================================================
-# Status
-# ==========================================================
-
-def send_status(latest_prices: Dict[str, float]) -> None:
-    eq = calculate_equity(latest_prices)
-    unrealized = eq - cash
-    net = eq - START_BALANCE
-
-    total = int(learning.get("trade_count", 0))
-    wins = int(learning.get("win_count", 0))
-    losses = int(learning.get("loss_count", 0))
-    win_rate = (wins / total * 100.0) if total > 0 else 0.0
-
-    send_telegram(
-        f"STATUS\n"
+    equity = compute_equity(latest_prices)
+    notify(
+        f"SELL {sym} ({reason})\n"
+        f"P/L: ${net_profit_usd:.2f}\n"
         f"Cash: ${cash:.2f}\n"
-        f"Equity: ${eq:.2f}\n"
-        f"Unrealized: ${unrealized:.2f}\n"
-        f"Net P/L: ${net:.2f}\n"
-        f"Open: {len(open_trades)}\n"
-        f"Trades: {total} | W: {wins} | L: {losses} | WR: {win_rate:.1f}%\n"
-        f"ML: {'ON' if model is not None else 'OFF'}"
+        f"Equity: ${equity:.2f}\n\n"
+        f"Trades: {trades}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Winrate: {winrate:.1f}%"
     )
 
-# ==========================================================
-# Boot
-# ==========================================================
+# =========================
+# MAIN LOOP
+# =========================
 
-if COINS == "AUTO":
-    SYMBOLS = cb_get_products_usd()[:MAX_SYMBOLS]
+symbols = get_symbols()
+if not symbols:
+    notify("BOT STARTED - No symbols found (check COINS/AUTO).")
 else:
-    SYMBOLS = [c for c in COINS.split(",") if c]
+    notify(f"BOT STARTED ({'PAPER' if PAPER_TRADING else 'REAL'}) | Symbols: {len(symbols)}")
 
+last_status_time = time.time()
+
+# warm train attempt
 train_model_if_ready()
-
-send_telegram(
-    "BOT STARTED\n"
-    f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE(DISABLED)'}\n"
-    f"Symbols: {len(SYMBOLS)}\n"
-    f"Max Open: {MAX_OPEN_TRADES}\n"
-    f"Min Trade: ${MIN_TRADE_SIZE_USD:.2f}\n"
-    f"ML: {'ON' if model is not None else 'OFF'}"
-)
-
-last_status = time.time()
-
-# ==========================================================
-# Main loop
-# ==========================================================
 
 while True:
     try:
-        # 1) Pull prices for symbols
+        # --- get latest prices (only for symbols we care about) ---
         latest_prices: Dict[str, float] = {}
-        for sym in SYMBOLS:
-            p = cb_get_price(sym)
+
+        # prioritize prices for open positions first
+        for sym in list(positions.keys()):
+            p = get_price(sym)
             if p is not None:
                 latest_prices[sym] = p
 
-        # 2) Manage open trades (stop/trail/stagnation)
-        if latest_prices:
-            manage_open_trades(latest_prices)
+        # then scan candidates (limited each loop to avoid rate limiting)
+        scan_batch = symbols[:]
+        # simple rotate each loop to cover universe over time
+        if len(symbols) > 0:
+            shift = int(time.time()) % len(symbols)
+            scan_batch = symbols[shift:] + symbols[:shift]
+        scan_batch = scan_batch[:min(len(scan_batch), max(20, MAX_OPEN_TRADES * 3))]
 
-        # 3) Scan for new trend-continuation entries
-        if can_open_more():
-            for sym in SYMBOLS:
-                if not can_open_more():
+        for sym in scan_batch:
+            if sym in latest_prices:
+                continue
+            p = get_price(sym)
+            if p is not None:
+                latest_prices[sym] = p
+
+        now = time.time()
+
+        # --- manage open trades (STOP / TRAIL / STAGNATION) ---
+        for sym in list(positions.keys()):
+            price = latest_prices.get(sym)
+            if price is None:
+                continue
+
+            pos = positions[sym]
+            entry = float(pos["entry"])
+
+            profit_pct = (price - entry) / entry
+            age_min = (now - float(pos["time"])) / 60.0
+
+            # peak update
+            if price > float(pos["peak"]):
+                pos["peak"] = price
+
+            # dynamic trail distance (max of fixed % and ATR-based)
+            atr_p = float((pos.get("features") or [0, 0, 0, 0, 0])[4] or 0.0)
+            dynamic_trail = max(TRAILING_DISTANCE_PERCENT / 100.0, ATR_MULT * atr_p)
+
+            # activate / update trail only after profit reaches threshold
+            if profit_pct >= (TRAILING_START_PERCENT / 100.0):
+                pos["trail"] = float(pos["peak"]) * (1.0 - dynamic_trail)
+
+            # hard stop
+            if price <= float(pos["stop"]):
+                sell_trade(sym, price, "STOP", latest_prices)
+                continue
+
+            # trailing stop
+            if pos["trail"] is not None and price <= float(pos["trail"]):
+                sell_trade(sym, price, "TRAIL", latest_prices)
+                continue
+
+            # stagnation (your rule)
+            if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
+                sell_trade(sym, price, "STAGNATION", latest_prices)
+                continue
+
+        # --- ML retrain periodically ---
+        train_model_if_ready()
+
+        # --- open new trades (ELITE continuation only) ---
+        if len(positions) < MAX_OPEN_TRADES:
+            for sym in scan_batch:
+                if sym in positions:
+                    continue
+                if len(positions) >= MAX_OPEN_TRADES:
                     break
-                if already_open(sym):
+
+                price = latest_prices.get(sym)
+                if price is None:
                     continue
 
-                feats_last = build_features(sym)
-                if feats_last is None:
+                built = build_features(sym)
+                if not built:
                     continue
 
-                feats, last_price = feats_last
-
-                # Trend continuation filter
-                if not trend_continuation_ok(feats):
+                feat, _info = built
+                if not passes_hard_filters(feat):
                     continue
 
-                # ML filter (if enabled)
-                if not ml_allows(feats):
+                score = entry_score(feat)
+                if score < MIN_ENTRY_SCORE:
                     continue
 
-                # Use latest ticker price when available; else candle close
-                entry_price = latest_prices.get(sym, last_price)
-                if entry_price is None:
+                allow, prob = ml_allows(feat)
+                if not allow:
                     continue
 
-                open_trade(sym, float(entry_price), feats)
+                open_trade(sym, price, feat, score, prob)
 
-                # ultra-frequency safety: don't open 20 trades in one loop tick
-                # open at most a few per scan
-                if len(open_trades) >= MAX_OPEN_TRADES:
-                    break
+        # --- status ---
+        if now - last_status_time >= STATUS_INTERVAL:
+            equity = compute_equity(latest_prices)
+            net = equity - START_BALANCE
+            trades = int(learning["trade_count"])
+            wins = int(learning["win_count"])
+            losses = int(learning["loss_count"])
+            winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+            ml_state = "ON" if model is not None else "OFF"
 
-        # 4) Status
-        if time.time() - last_status >= STATUS_INTERVAL:
-            send_status(latest_prices)
-            last_status = time.time()
+            notify(
+                f"STATUS\n"
+                f"Cash: ${cash:.2f}\n"
+                f"Equity: ${equity:.2f}\n"
+                f"Net: ${net:.2f}\n"
+                f"Open: {len(positions)}\n"
+                f"Trades: {trades} | Wins: {wins} | Losses: {losses} | WR: {winrate:.1f}%\n"
+                f"ML: {ml_state}"
+            )
+            last_status_time = now
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
-        send_telegram(f"ERROR: {str(e)}")
+        notify(f"ERROR {str(e)}")
         time.sleep(5)
