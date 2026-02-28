@@ -2,443 +2,843 @@ import os
 import time
 import json
 import csv
+import math
+import base64
 import requests
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
-# =========================
-# CONFIG
-# =========================
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 12))
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
+# ============================================================
+# Helpers: env var parsing + backward-compatible aliases
+# ============================================================
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
-EXCLUDE = set(os.getenv("EXCLUDE", "USDT-USD,USDC-USD").split(","))
+def _env(name: str) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v if v != "" else None
 
-START_BALANCE = float(os.getenv("START_BALANCE", 1000))
-CASH_RESERVE_PERCENT = float(os.getenv("CASH_RESERVE_PERCENT", 2))
+def env_str(*names: str, default: str = "") -> str:
+    for n in names:
+        v = _env(n)
+        if v is not None:
+            return v
+    return default
 
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
-MIN_TRADE_SIZE_USD = float(os.getenv("MIN_TRADE_SIZE_USD", 25))
+def env_int(*names: str, default: int) -> int:
+    for n in names:
+        v = _env(n)
+        if v is not None:
+            try:
+                return int(float(v))
+            except Exception:
+                pass
+    return default
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 2.8))
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 1.2))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
+def env_float(*names: str, default: float) -> float:
+    for n in names:
+        v = _env(n)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return default
 
-ATR_MULT = float(os.getenv("ATR_MULT", 1.4))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", 14))
+def env_bool(*names: str, default: bool) -> bool:
+    for n in names:
+        v = _env(n)
+        if v is not None:
+            return v.lower() in ("1", "true", "yes", "y", "on")
+    return default
 
-MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 30))
 
-ML_MIN_TRADES_TO_ENABLE = int(os.getenv("ML_MIN_TRADES_TO_ENABLE", 50))
-ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", 0.58))
-ML_RETRAIN_EVERY_SEC = int(os.getenv("ML_RETRAIN_EVERY_SEC", 600))
+# ============================================================
+# CONFIG (Railway env vars) — canonical names + aliases
+# ============================================================
 
-FEE_PERCENT_PER_SIDE = float(os.getenv("FEE_PERCENT_PER_SIDE", 0.20))
+# Timing
+SCAN_INTERVAL = env_int("SCAN_INTERVAL", default=12)  # alias in screenshots: SCAN_INTERVAL
+STATUS_INTERVAL = env_int("STATUS_INTERVAL", "STATUS_INTERVA", default=60)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Universe
+COINS = env_str("COINS", default="AUTO").strip()
+MAX_SYMBOLS = env_int("MAX_SYMBOLS", default=60)
+EXCLUDE_RAW = env_str("EXCLUDE", default="")
+EXCLUDE = {s.strip().upper() for s in EXCLUDE_RAW.split(",") if s.strip()}
 
+# Risk / exposure
+START_BALANCE = env_float("START_BALANCE", "START_BALANCE", "START_BAL", "START", default=1000.0)
+CASH_RESERVE_PERCENT = env_float("CASH_RESERVE_PERCENT", "CASH_RESERVE_P", "MIN_CASH_RESER", default=5.0)
+
+MAX_OPEN_TRADES = env_int("MAX_OPEN_TRADES", "MAX_OPEN_TRADE", "MAX_OPEN_TR", default=20)
+MIN_TRADE_SIZE_USD = env_float("MIN_TRADE_SIZE_USD", "MIN_TRADE_SIZE", "MIN_TRADE_SIZ", default=25.0)
+
+# Position sizing (percent of cash) — aliases from your screenshots
+MIN_POSITION_SIZE_PERCENT = env_float("MIN_POSITION_SIZE_PERCENT", "MIN_POSITION_S", "MIN_POSITION_U", default=1.0)
+MAX_POSITION_SIZE_PERCENT = env_float("MAX_POSITION_SIZE_PERCENT", "MAX_POSITION_S", default=3.0)
+
+# Stops — aliases from your screenshots
+STOP_LOSS_PERCENT = env_float("STOP_LOSS_PERCENT", "STOP_LOSS_PERC", "STOP_LOSS_PERC_", "STOP_LOSS_PERCEN", default=2.8)
+TRAILING_START_PERCENT = env_float("TRAILING_START_PERCENT", "TRAILING_START", default=1.2)
+TRAILING_DISTANCE_PERCENT = env_float("TRAILING_DISTANCE_PERCENT", "TRAILING_DIST", "TRAILING_DISTANC", "TRAILING_DISTAN", "TRAILING_DIST", "TRAILING_DISTA", default=0.9)
+
+# ATR trailing
+ATR_PERIOD = env_int("ATR_PERIOD", "ATR_PERIO", default=14)
+ATR_MULT = env_float("ATR_MULT", default=1.4)  # you bumped to 1.4
+
+# Time exits — alias from screenshots
+MAX_TRADE_DURATION_MINUTES = env_int("MAX_TRADE_DURATION_MINUTES", "MAX_TRADE_DURA", "MAX_TRADE_DUR", default=30)
+
+# Entry strictness (Elite)
+MIN_ENTRY_SCORE = env_float("MIN_ENTRY_SCORE", "MIN_ENTRY_SCOR", default=7.0)
+MIN_TREND_STRENGTH = env_float("MIN_TREND_STRENGTH", "MIN_TREND_STRE", default=0.20)
+MIN_VOLUME_RATIO = env_float("MIN_VOLUME_RATIO", "MIN_VOLUME_RAT", "MIN_VOL_RATIO", default=1.25)
+RSI_MIN = env_float("RSI_MIN", default=52.0)
+RSI_MAX = env_float("RSI_MAX", default=72.0)
+
+# Candles — aliases from screenshots
+CANDLE_GRANULARITY = env_int("CANDLE_GRANULARITY", "CANDLE_GRANULA", default=60)
+CANDLE_POINTS = env_int("CANDLE_POINTS", default=120)
+
+# ML — aliases from screenshots
+ML_MIN_TRADES_TO_ENABLE = env_int("ML_MIN_TRADES_TO_ENABLE", "ML_MIN_TRADES_", "ML_MIN_TRADES", default=50)
+ML_MIN_PROB = env_float("ML_MIN_PROB", "ML_MIN_PROB", default=0.58)
+ML_RETRAIN_EVERY_SEC = env_int("ML_RETRAIN_EVERY_SEC", "ML_RETRAIN_EVE", default=600)
+
+# Fee estimate — alias from screenshots
+FEE_PERCENT_PER_SIDE = env_float("FEE_PERCENT_PER_SIDE", "FEE_PERCENT_PE", default=0.20)
+
+# Mode
+PAPER_TRADING = env_bool("PAPER_TRADING", default=True)
+
+# Telegram (optional)
+TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID") or _env("TELEGRAM_CHAT_")  # your screenshot shows TELEGRAM_CHAT_
+
+# GitHub (optional sync)
+GITHUB_TOKEN = _env("GITHUB_TOKEN")
+GITHUB_REPO = _env("GITHUB_REPO")          # format: yourusername/repo
+GITHUB_BRANCH = _env("GITHUB_BRANCH") or "main"
+
+# Files
 LEARNING_FILE = "learning.json"
 HISTORY_FILE = "trade_history.csv"
 
-BASE = "https://api.exchange.coinbase.com/products"
+# Coinbase endpoints (public)
+BASE_URL = "https://api.exchange.coinbase.com"
+PRODUCTS_URL = f"{BASE_URL}/products"
+TICKER_URL = f"{BASE_URL}/products/{{}}/ticker"
+CANDLES_URL = f"{BASE_URL}/products/{{}}/candles"
 
-# =========================
-# TELEGRAM
-# =========================
 
-def notify(msg):
+# ============================================================
+# HTTP session + notify
+# ============================================================
 
+session = requests.Session()
+session.headers.update({"User-Agent": "coin-sniper/elite"})
+
+def notify(msg: str) -> None:
     print(msg, flush=True)
-
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10
-            )
-        except:
-            pass
-
-# =========================
-# FILE INIT
-# =========================
-
-def init_learning():
-
-    if os.path.exists(LEARNING_FILE):
-
-        with open(LEARNING_FILE,"r") as f:
-
-            data=json.load(f)
-
-    else:
-
-        data={}
-
-    data.setdefault("cash",START_BALANCE)
-    data.setdefault("trade_count",0)
-    data.setdefault("win_count",0)
-    data.setdefault("loss_count",0)
-    data.setdefault("total_profit_usd",0)
-
-    save_learning(data)
-
-    return data
-
-def save_learning(data):
-
-    with open(LEARNING_FILE,"w") as f:
-
-        json.dump(data,f)
-
-def init_history():
-
-    if not os.path.exists(HISTORY_FILE):
-
-        with open(HISTORY_FILE,"w",newline="") as f:
-
-            w=csv.writer(f)
-
-            w.writerow([
-                "rsi",
-                "volume",
-                "trend",
-                "momentum",
-                "atr",
-                "profit"
-            ])
-
-def append_history(row):
-
-    with open(HISTORY_FILE,"a",newline="") as f:
-
-        csv.writer(f).writerow(row)
-
-learning=init_learning()
-init_history()
-
-cash=float(learning["cash"])
-positions={}
-
-# =========================
-# MARKET
-# =========================
-
-def get_symbols():
-
-    r=requests.get(BASE)
-
-    data=r.json()
-
-    out=[]
-
-    for d in data:
-
-        sym=d["id"]
-
-        if d["quote_currency"]!="USD":
-            continue
-
-        if sym in EXCLUDE:
-            continue
-
-        out.append(sym)
-
-    return out[:MAX_SYMBOLS]
-
-def price(sym):
-
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     try:
-
-        r=requests.get(f"{BASE}/{sym}/ticker")
-
-        return float(r.json()["price"])
-
-    except:
-
-        return None
-
-def candles(sym):
-
-    try:
-
-        r=requests.get(f"{BASE}/{sym}/candles",params={"granularity":60})
-
-        data=list(reversed(r.json()))
-
-        closes=[x[4] for x in data]
-        highs=[x[2] for x in data]
-        lows=[x[1] for x in data]
-        vols=[x[5] for x in data]
-
-        return closes,highs,lows,vols
-
-    except:
-
-        return None
-
-# =========================
-# INDICATORS
-# =========================
-
-def rsi(closes):
-
-    if len(closes)<15:return 50
-
-    d=np.diff(closes)
-
-    up=np.where(d>0,d,0)
-
-    dn=np.where(d<0,-d,0)
-
-    rs=np.mean(up[-14:])/max(np.mean(dn[-14:]),1e-9)
-
-    return 100-(100/(1+rs))
-
-def trend(closes):
-
-    return (np.mean(closes[-10:])-np.mean(closes[-40:]))/np.mean(closes[-40:])
-
-def momentum(closes):
-
-    return (closes[-1]-closes[-5])/closes[-5]
-
-def volume(vols):
-
-    return vols[-1]/np.mean(vols[-20:])
-
-def atr(highs,lows,closes):
-
-    tr=[max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(closes))]
-
-    return np.mean(tr[-ATR_PERIOD:])/closes[-1]
-
-# =========================
-# ML
-# =========================
-
-model=None
-last_train=0
-
-def train():
-
-    global model,last_train
-
-    if time.time()-last_train<ML_RETRAIN_EVERY_SEC:return
-
-    last_train=time.time()
-
-    try:
-
-        data=np.genfromtxt(HISTORY_FILE,delimiter=",",skip_header=1)
-
-        if len(data)<ML_MIN_TRADES_TO_ENABLE:
-
-            model=None
-
-            return
-
-        X=data[:,:-1]
-        y=data[:,-1]>0
-
-        model=RandomForestClassifier(n_estimators=300,max_depth=6)
-
-        model.fit(X,y)
-
-        notify("ML ACTIVATED")
-
-    except:
-
-        model=None
-
-def ml_allow(f):
-
-    if model is None:return True,0
-
-    p=model.predict_proba([f])[0][1]
-
-    return p>=ML_MIN_PROB,p
-
-# =========================
-# EQUITY
-# =========================
-
-def equity(prices):
-
-    e=cash
-
-    for s,p in positions.items():
-
-        if s in prices:
-
-            e+=p["qty"]*prices[s]
-
-    return e
-
-# =========================
-# EXECUTION
-# =========================
-
-def buy(sym,price,f):
-
-    global cash
-
-    if len(positions)>=MAX_OPEN_TRADES:return
-
-    size=max(MIN_TRADE_SIZE_USD,cash*0.05)
-
-    if size>cash:return
-
-    qty=size/price
-
-    positions[sym]={
-
-        "entry":price,
-        "qty":qty,
-        "size":size,
-        "peak":price,
-        "time":time.time(),
-        "features":f
-
+        session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# GitHub Sync (optional) — stores learning.json + trade_history.csv
+# ============================================================
+
+def gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "coin-sniper/elite"
     }
 
-    cash-=size
+def gh_get_file(path: str) -> Tuple[Optional[bytes], Optional[str]]:
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        return None, None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    try:
+        r = session.get(url, headers=gh_headers(), params={"ref": GITHUB_BRANCH}, timeout=15)
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        content_b64 = data.get("content")
+        sha = data.get("sha")
+        if not content_b64:
+            return None, sha
+        raw = base64.b64decode(content_b64.encode("utf-8"))
+        return raw, sha
+    except Exception:
+        return None, None
 
-    learning["cash"]=cash
+def gh_put_file(path: str, content_bytes: bytes, message: str) -> None:
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    # get sha if exists
+    _, sha = gh_get_file(path)
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch": GITHUB_BRANCH
+    }
+    if sha:
+        payload["sha"] = sha
+    try:
+        session.put(url, headers=gh_headers(), json=payload, timeout=20)
+    except Exception:
+        pass
 
-    save_learning(learning)
+def gh_pull_if_present() -> None:
+    # Pull remote into local if found
+    for fname in (LEARNING_FILE, HISTORY_FILE):
+        raw, _sha = gh_get_file(fname)
+        if raw:
+            try:
+                with open(fname, "wb") as f:
+                    f.write(raw)
+                notify(f"GITHUB SYNC: Pulled {fname}")
+            except Exception:
+                pass
 
-    notify(f"BUY {sym}\n${size:.2f}\nCash ${cash:.2f}")
+_last_gh_push = 0.0
+def gh_push_throttled(reason: str) -> None:
+    global _last_gh_push
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        return
+    now = time.time()
+    # throttle pushes so you don't spam the API
+    if now - _last_gh_push < 30:
+        return
+    _last_gh_push = now
+    try:
+        if os.path.exists(LEARNING_FILE):
+            with open(LEARNING_FILE, "rb") as f:
+                gh_put_file(LEARNING_FILE, f.read(), f"Update {LEARNING_FILE} ({reason})")
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "rb") as f:
+                gh_put_file(HISTORY_FILE, f.read(), f"Update {HISTORY_FILE} ({reason})")
+        notify("GITHUB SYNC: Pushed learning/history")
+    except Exception:
+        pass
 
-def sell(sym,price,reason,prices):
 
+# ============================================================
+# Persistent learning state
+# ============================================================
+
+def load_learning() -> Dict:
+    default = {
+        "cash": START_BALANCE,
+        "trade_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "total_profit_usd": 0.0
+    }
+    if not os.path.exists(LEARNING_FILE):
+        return default
+    try:
+        with open(LEARNING_FILE, "r") as f:
+            data = json.load(f)
+        # Patch missing fields so upgrades never crash
+        for k, v in default.items():
+            if k not in data:
+                data[k] = v
+        # backward compat
+        if "total_profit" in data and "total_profit_usd" not in data:
+            data["total_profit_usd"] = float(data.get("total_profit", 0.0))
+        return data
+    except Exception:
+        return default
+
+def save_learning(state: Dict) -> None:
+    try:
+        with open(LEARNING_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Trade history for ML
+# ============================================================
+
+def ensure_history() -> None:
+    if os.path.exists(HISTORY_FILE):
+        return
+    try:
+        with open(HISTORY_FILE, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["rsi", "volume_ratio", "trend_strength", "momentum", "atr_pct", "profit_usd"])
+    except Exception:
+        pass
+
+def append_history(row: List[float]) -> None:
+    try:
+        with open(HISTORY_FILE, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Market data
+# ============================================================
+
+def get_symbols_auto() -> List[str]:
+    try:
+        r = session.get(PRODUCTS_URL, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out: List[str] = []
+        for d in data:
+            pid = d.get("id", "")
+            if not pid:
+                continue
+            if pid.upper() in EXCLUDE:
+                continue
+            if d.get("quote_currency") != "USD":
+                continue
+            # skip obvious stables
+            if pid.endswith("-USDT") or pid.endswith("-USDC") or pid.startswith("USD-"):
+                continue
+            out.append(pid)
+        return out[:MAX_SYMBOLS]
+    except Exception:
+        return []
+
+def get_symbols() -> List[str]:
+    if COINS.upper() == "AUTO":
+        return get_symbols_auto()
+    coins = [c.strip() for c in COINS.split(",") if c.strip()]
+    coins = [c for c in coins if c.upper() not in EXCLUDE]
+    return coins[:MAX_SYMBOLS]
+
+def get_price(symbol: str) -> Optional[float]:
+    try:
+        r = session.get(TICKER_URL.format(symbol), timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        p = data.get("price")
+        if p is None:
+            return None
+        return float(p)
+    except Exception:
+        return None
+
+def get_candles(symbol: str, granularity: int, points: int) -> Optional[List[List[float]]]:
+    # response: [ time, low, high, open, close, volume ]
+    try:
+        r = session.get(
+            CANDLES_URL.format(symbol),
+            params={"granularity": str(granularity)},
+            timeout=12
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) < 25:
+            return None
+        data = list(reversed(data))  # oldest -> newest
+        return data[-min(points, len(data)):]
+    except Exception:
+        return None
+
+
+# ============================================================
+# Indicators
+# ============================================================
+
+def ema(arr: np.ndarray, period: int) -> float:
+    if len(arr) < 2:
+        return float(arr[0]) if len(arr) else 0.0
+    k = 2.0 / (period + 1.0)
+    e = float(arr[0])
+    for v in arr[1:]:
+        e = float(v) * k + e * (1.0 - k)
+    return float(e)
+
+def calc_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    a = np.array(closes, dtype=float)
+    d = np.diff(a)
+    gains = np.where(d > 0, d, 0.0)
+    losses = np.where(d < 0, -d, 0.0)
+    avg_gain = float(np.mean(gains[-period:]))
+    avg_loss = float(np.mean(losses[-period:]))
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return float(100.0 - (100.0 / (1.0 + rs)))
+
+def momentum(closes: List[float], lookback: int = 5) -> float:
+    if len(closes) < lookback + 1:
+        return 0.0
+    prev = closes[-1 - lookback]
+    if prev == 0:
+        return 0.0
+    return float((closes[-1] - prev) / prev)
+
+def volume_ratio(vols: List[float], period: int = 20) -> float:
+    if len(vols) < 2:
+        return 1.0
+    p = min(period, len(vols))
+    avg = float(np.mean(vols[-p:]))
+    if avg <= 0:
+        return 1.0
+    return float(vols[-1] / avg)
+
+def atr_percent(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+    # safe ATR% implementation (no atr() signature mismatch)
+    if len(closes) < period + 2:
+        return 0.0
+    h = np.array(highs, dtype=float)
+    l = np.array(lows, dtype=float)
+    c = np.array(closes, dtype=float)
+    prev_close = c[:-1]
+    tr = np.maximum(
+        h[1:] - l[1:],
+        np.maximum(np.abs(h[1:] - prev_close), np.abs(l[1:] - prev_close))
+    )
+    atr = float(np.mean(tr[-period:]))
+    last_close = float(c[-1])
+    if last_close <= 0:
+        return 0.0
+    return float(atr / last_close)
+
+def trend_strength(closes: List[float]) -> float:
+    if len(closes) < 60:
+        return 0.0
+    arr = np.array(closes, dtype=float)
+    ema_fast = ema(arr[-50:], 20)
+    ema_slow = ema(arr[-60:], 50)
+    if ema_slow <= 0:
+        return 0.0
+    spread = (ema_fast - ema_slow) / ema_slow
+    ema_fast_10ago = ema(arr[-60:-10], 20)
+    slope = (ema_fast - ema_fast_10ago) / ema_slow
+    return float(spread + slope)
+
+def build_features(symbol: str) -> Optional[List[float]]:
+    candles = get_candles(symbol, CANDLE_GRANULARITY, CANDLE_POINTS)
+    if not candles:
+        return None
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows  = [float(c[1]) for c in candles]
+    vols  = [float(c[5]) for c in candles]
+
+    rsi_v = calc_rsi(closes, 14)
+    vol_r = volume_ratio(vols, 20)
+    trend_v = trend_strength(closes)
+    mom_v = momentum(closes, 5)
+    atr_p = atr_percent(highs, lows, closes, ATR_PERIOD)
+
+    return [float(rsi_v), float(vol_r), float(trend_v), float(mom_v), float(atr_p)]
+
+
+# ============================================================
+# Entry scoring + hard filters (choppy-market continuation)
+# ============================================================
+
+def passes_hard_filters(feat: List[float]) -> bool:
+    rsi_v, vol_r, trend_v, mom_v, atr_p = feat
+    if trend_v <= 0:
+        return False
+    if mom_v <= 0:
+        return False
+    if vol_r < 1.05:
+        return False
+    # avoid dead / insanely wild
+    if atr_p <= 0.0008:
+        return False
+    if atr_p >= 0.080:
+        return False
+    return True
+
+def entry_score(feat: List[float]) -> float:
+    rsi_v, vol_r, trend_v, mom_v, atr_p = feat
+    score = 0.0
+
+    if trend_v > MIN_TREND_STRENGTH:
+        score += 4.0
+    elif trend_v > 0:
+        score += 2.0
+
+    if mom_v > 0.002:
+        score += 2.0
+    elif mom_v > 0:
+        score += 1.0
+
+    if vol_r >= MIN_VOLUME_RATIO:
+        score += 2.5
+    elif vol_r >= 1.10:
+        score += 1.5
+
+    if RSI_MIN <= rsi_v <= RSI_MAX:
+        score += 1.5
+    elif 50 <= rsi_v < RSI_MIN:
+        score += 0.75
+
+    # moderate ATR gets a tiny bump
+    if 0.002 <= atr_p <= 0.040:
+        score += 0.5
+
+    return float(score)
+
+
+# ============================================================
+# ML model (filters entries once enough trades exist)
+# ============================================================
+
+model: Optional[RandomForestClassifier] = None
+_last_train = 0.0
+
+def train_model_if_ready() -> None:
+    global model, _last_train
+    now = time.time()
+    if now - _last_train < ML_RETRAIN_EVERY_SEC:
+        return
+    _last_train = now
+
+    if not os.path.exists(HISTORY_FILE):
+        model = None
+        return
+
+    try:
+        data = np.genfromtxt(HISTORY_FILE, delimiter=",", skip_header=1)
+        if data is None or (hasattr(data, "size") and data.size == 0):
+            model = None
+            return
+        if data.ndim == 1:
+            data = np.expand_dims(data, axis=0)
+
+        if len(data) < ML_MIN_TRADES_TO_ENABLE:
+            model = None
+            return
+
+        X = data[:, :-1]
+        y = (data[:, -1] > 0).astype(int)
+
+        m = RandomForestClassifier(
+            n_estimators=300,
+            random_state=42,
+            max_depth=7,
+            min_samples_leaf=3
+        )
+        m.fit(X, y)
+        model = m
+        notify(f"ML MODEL ACTIVATED ({len(data)} trades)")
+    except Exception:
+        model = None
+
+def ml_allows(feat: List[float]) -> Tuple[bool, float]:
+    if model is None:
+        return True, 0.0
+    try:
+        prob = float(model.predict_proba([feat])[0][1])
+        return prob >= ML_MIN_PROB, prob
+    except Exception:
+        return True, 0.0
+
+
+# ============================================================
+# Portfolio / paper execution
+# ============================================================
+
+learning = {}
+cash = 0.0
+positions: Dict[str, Dict] = {}
+
+def compute_equity(latest_prices: Dict[str, float]) -> float:
+    eq = float(cash)
+    for sym, pos in positions.items():
+        p = latest_prices.get(sym)
+        if p is None:
+            continue
+        eq += float(pos["qty"] * p)
+    return float(eq)
+
+def cash_reserve_amount() -> float:
+    return float(cash * (CASH_RESERVE_PERCENT / 100.0))
+
+def position_size_usd(score: float) -> float:
+    pct = MIN_POSITION_SIZE_PERCENT + (max(0.0, min(10.0, score)) / 10.0) * (MAX_POSITION_SIZE_PERCENT - MIN_POSITION_SIZE_PERCENT)
+    raw = cash * (pct / 100.0)
+    size = max(MIN_TRADE_SIZE_USD, raw)
+    available = max(0.0, cash - cash_reserve_amount())
+    return float(min(size, available))
+
+def open_trade(sym: str, price: float, feat: List[float], score: float, ml_prob: float) -> None:
     global cash
 
-    p=positions[sym]
+    if sym in positions:
+        return
+    if len(positions) >= MAX_OPEN_TRADES:
+        return
 
-    proceeds=p["qty"]*price
+    size = position_size_usd(score)
+    if size <= 0 or size > cash:
+        return
 
-    profit=proceeds-p["size"]
+    qty = size / price
+    if qty <= 0:
+        return
 
-    fee=(p["size"]+proceeds)*(FEE_PERCENT_PER_SIDE/100)
+    stop_price = price * (1 - STOP_LOSS_PERCENT / 100.0)
 
-    net=profit-fee
+    positions[sym] = {
+        "entry": price,
+        "qty": qty,
+        "size": size,
+        "time": time.time(),
+        "peak": price,
+        "stop": stop_price,
+        "trail": None,
+        "features": feat
+    }
 
-    cash+=proceeds
+    cash -= size
+    learning["cash"] = cash
+    save_learning(learning)
+    gh_push_throttled("buy")
 
-    learning["cash"]=cash
-    learning["trade_count"]+=1
-    learning["total_profit_usd"]+=net
+    notify(
+        f"BUY {sym}\n"
+        f"Price: {price:.6f}\n"
+        f"Size: ${size:.2f}\n"
+        f"Score: {score:.2f} | ML: {ml_prob:.2f}\n"
+        f"Cash: ${cash:.2f}"
+    )
 
-    if net>0:
-        learning["win_count"]+=1
+def sell_trade(sym: str, price: float, reason: str, latest_prices: Dict[str, float]) -> None:
+    global cash
+
+    pos = positions.get(sym)
+    if not pos:
+        return
+
+    entry = float(pos["entry"])
+    qty = float(pos["qty"])
+    size = float(pos["size"])
+
+    proceeds = qty * price
+    gross_profit_usd = proceeds - size
+
+    # Fee estimate per side (entry + exit)
+    fee_entry = size * (FEE_PERCENT_PER_SIDE / 100.0)
+    fee_exit = proceeds * (FEE_PERCENT_PER_SIDE / 100.0)
+    net_profit_usd = gross_profit_usd - fee_entry - fee_exit
+
+    cash += proceeds
+
+    learning["trade_count"] += 1
+    if net_profit_usd > 0:
+        learning["win_count"] += 1
     else:
-        learning["loss_count"]+=1
-
+        learning["loss_count"] += 1
+    learning["total_profit_usd"] += float(net_profit_usd)
+    learning["cash"] = cash
     save_learning(learning)
 
-    append_history(p["features"]+[net])
+    # Persist ML training row with REAL features from entry time
+    f = pos.get("features") or [50.0, 1.0, 0.0, 0.0, 0.01]
+    append_history([f[0], f[1], f[2], f[3], f[4], float(net_profit_usd)])
 
     del positions[sym]
 
-    wr=learning["win_count"]/learning["trade_count"]*100
+    trades = int(learning["trade_count"])
+    wins = int(learning["win_count"])
+    losses = int(learning["loss_count"])
+    winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
+    equity = compute_equity(latest_prices)
     notify(
-f"""SELL {sym} ({reason})
-P/L ${net:.2f}
-Cash ${cash:.2f}
-Equity ${equity(prices):.2f}
+        f"SELL {sym} ({reason})\n"
+        f"P/L (net): ${net_profit_usd:.2f}\n"
+        f"Cash: ${cash:.2f}\n"
+        f"Equity: ${equity:.2f}\n\n"
+        f"Trades: {trades}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Winrate: {winrate:.1f}%"
+    )
 
-Trades {learning['trade_count']}
-Wins {learning['win_count']}
-Losses {learning['loss_count']}
-WR {wr:.1f}%
-ML {"ON" if model else "OFF"}"""
+    gh_push_throttled("sell")
+
+
+# ============================================================
+# Boot sequence
+# ============================================================
+
+# Optional GitHub pull first (so you keep learning even after changing vars)
+gh_pull_if_present()
+
+ensure_history()
+
+learning = load_learning()
+cash = float(learning.get("cash", START_BALANCE))
+
+symbols = get_symbols()
+
+notify(
+    f"BOT STARTED ({'PAPER' if PAPER_TRADING else 'REAL'})\n"
+    f"Symbols: {len(symbols)} | MaxOpen: {MAX_OPEN_TRADES}\n"
+    f"Stop: {STOP_LOSS_PERCENT:.2f}% | TrailStart: {TRAILING_START_PERCENT:.2f}% | TrailDist: {TRAILING_DISTANCE_PERCENT:.2f}% | ATRx: {ATR_MULT:.2f}\n"
+    f"MinTrade: ${MIN_TRADE_SIZE_USD:.2f} | Fee/side: {FEE_PERCENT_PER_SIDE:.2f}%"
 )
 
-# =========================
-# MAIN
-# =========================
+last_status_time = time.time()
+train_model_if_ready()
 
-symbols=get_symbols()
 
-notify("BOT STARTED")
+# ============================================================
+# Main loop
+# ============================================================
 
 while True:
-
     try:
+        if not symbols:
+            notify("No symbols found. Check COINS=AUTO and MAX_SYMBOLS, or set COINS=BTC-USD,ETH-USD,...")
+            time.sleep(30)
+            symbols = get_symbols()
+            continue
 
-        train()
+        now = time.time()
 
-        prices={}
+        # Pull latest prices for open positions first
+        latest_prices: Dict[str, float] = {}
+        for sym in list(positions.keys()):
+            p = get_price(sym)
+            if p is not None:
+                latest_prices[sym] = p
 
-        for s in symbols[:40]:
+        # Rotate scan set to reduce rate limiting
+        shift = int(time.time()) % len(symbols)
+        scan_batch = symbols[shift:] + symbols[:shift]
+        scan_batch = scan_batch[:min(len(scan_batch), max(25, MAX_OPEN_TRADES * 4))]
 
-            p=price(s)
+        for sym in scan_batch:
+            if sym in latest_prices:
+                continue
+            p = get_price(sym)
+            if p is not None:
+                latest_prices[sym] = p
 
-            if p:prices[s]=p
+        # ---- Manage open trades ----
+        for sym in list(positions.keys()):
+            price = latest_prices.get(sym)
+            if price is None:
+                continue
 
-        for s,p in list(positions.items()):
+            pos = positions[sym]
+            entry = float(pos["entry"])
 
-            pr=prices.get(s)
+            profit_pct = (price - entry) / entry
+            age_min = (now - float(pos["time"])) / 60.0
 
-            if not pr:continue
+            # peak update
+            if price > float(pos["peak"]):
+                pos["peak"] = price
 
-            profit=(pr-p["entry"])/p["entry"]
+            # ATR-based dynamic trailing (uses entry-time ATR% for stability)
+            atr_p = float((pos.get("features") or [0, 0, 0, 0, 0])[4] or 0.0)
+            dynamic_trail = max(TRAILING_DISTANCE_PERCENT / 100.0, ATR_MULT * atr_p)
 
-            age=(time.time()-p["time"])/60
+            # activate/update trail once in profit
+            if profit_pct >= (TRAILING_START_PERCENT / 100.0):
+                pos["trail"] = float(pos["peak"]) * (1.0 - dynamic_trail)
 
-            if pr>p["peak"]:p["peak"]=pr
+            # hard stop
+            if price <= float(pos["stop"]):
+                sell_trade(sym, price, "STOP", latest_prices)
+                continue
 
-            trail=max(TRAILING_DISTANCE_PERCENT/100,ATR_MULT*atr(*candles(s)))
+            # trailing stop
+            if pos["trail"] is not None and price <= float(pos["trail"]):
+                sell_trade(sym, price, "TRAIL", latest_prices)
+                continue
 
-            if profit>=TRAILING_START_PERCENT/100:
+            # stagnation exit
+            if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
+                sell_trade(sym, price, "STAGNATION", latest_prices)
+                continue
 
-                stop=p["peak"]*(1-trail)
+        # ---- ML retrain periodically ----
+        train_model_if_ready()
 
-                if pr<=stop:sell(s,pr,"TRAIL",prices)
+        # ---- Open new trades ----
+        if len(positions) < MAX_OPEN_TRADES:
+            for sym in scan_batch:
+                if sym in positions:
+                    continue
+                if len(positions) >= MAX_OPEN_TRADES:
+                    break
 
-            elif profit<=-STOP_LOSS_PERCENT/100:
+                price = latest_prices.get(sym)
+                if price is None:
+                    continue
 
-                sell(s,pr,"STOP",prices)
+                feat = build_features(sym)
+                if not feat:
+                    continue
 
-            elif age>=MAX_TRADE_DURATION_MINUTES and profit<=0:
+                if not passes_hard_filters(feat):
+                    continue
 
-                sell(s,pr,"STAGNATION",prices)
+                score = entry_score(feat)
+                if score < MIN_ENTRY_SCORE:
+                    continue
 
-        for s in symbols:
+                allow, prob = ml_allows(feat)
+                if not allow:
+                    continue
 
-            if s in positions:continue
+                open_trade(sym, price, feat, score, prob)
 
-            c=candles(s)
+        # ---- Status ----
+        if now - last_status_time >= STATUS_INTERVAL:
+            equity = compute_equity(latest_prices)
+            net = equity - START_BALANCE
+            trades = int(learning["trade_count"])
+            wins = int(learning["win_count"])
+            losses = int(learning["loss_count"])
+            winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+            ml_state = "ON" if model is not None else "OFF"
 
-            if not c:continue
+            notify(
+                f"STATUS\n"
+                f"Cash: ${cash:.2f}\n"
+                f"Equity: ${equity:.2f}\n"
+                f"Net: ${net:.2f}\n"
+                f"Open: {len(positions)}\n"
+                f"Trades: {trades} | Wins: {wins} | Losses: {losses} | WR: {winrate:.1f}%\n"
+                f"ML: {ml_state}"
+            )
 
-            closes,highs,lows,vols=c
-
-            f=[
-                rsi(closes),
-                volume(vols),
-                trend(closes),
-                momentum(closes),
-                atr(highs,lows,closes)
-            ]
-
-            allow,p=ml_allow(f)
-
-            if allow and f[1]>1.2 and f[2]>0 and f[3]>0:
-
-                buy(s,prices.get(s),f)
+            gh_push_throttled("status")
+            last_status_time = now
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
-
-        notify(str(e))
-
+        notify(f"ERROR {str(e)}")
         time.sleep(5)
