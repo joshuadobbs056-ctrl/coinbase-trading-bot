@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 # =========================
-# CONFIG FROM ENV
+# CONFIG
 # =========================
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
@@ -66,36 +66,53 @@ if os.path.exists(LEARNING_FILE):
 # =========================
 
 def send_telegram(msg):
-    if not TELEGRAM_TOKEN:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        })
-    except:
-        pass
+
+    print(msg, flush=True)
+
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+
+        try:
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+            requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": msg
+                },
+                timeout=10
+            )
+
+        except:
+            pass
 
 # =========================
-# GET SYMBOLS
+# SYMBOL LIST
 # =========================
 
 def get_symbols():
+
     try:
+
         r = requests.get(COINBASE_PRODUCTS)
+
         data = r.json()
+
         symbols = [
             d["id"]
             for d in data
             if d["quote_currency"] == "USD"
         ]
+
         return symbols[:MAX_SYMBOLS]
+
     except:
+
         return []
 
 # =========================
-# GET PRICE
+# PRICE
 # =========================
 
 def get_price(symbol):
@@ -115,15 +132,38 @@ def get_price(symbol):
         return float(data["price"])
 
     except:
+
         return None
 
+# =========================
+# EQUITY CALCULATION
+# =========================
+
+def calculate_equity():
+
+    equity = balance
+
+    for symbol, pos in positions.items():
+
+        price = get_price(symbol)
+
+        if price is None:
+            continue
+
+        value = pos["size"] * (price / pos["entry"])
+
+        equity += value
+
+    return equity
 
 # =========================
 # SAVE LEARNING
 # =========================
 
 def save_learning():
+
     with open(LEARNING_FILE, "w") as f:
+
         json.dump(learning, f)
 
 # =========================
@@ -139,6 +179,7 @@ def save_history(features, profit):
         writer = csv.writer(f)
 
         if not file_exists:
+
             writer.writerow([
                 "rsi",
                 "volume_ratio",
@@ -149,9 +190,8 @@ def save_history(features, profit):
 
         writer.writerow(features + [profit])
 
-
 # =========================
-# ML MODEL
+# ML TRAIN
 # =========================
 
 model = None
@@ -176,10 +216,10 @@ def train_model():
     y = data[:, -1] > 0
 
     model = RandomForestClassifier()
+
     model.fit(X, y)
 
     send_telegram("ML MODEL ACTIVATED")
-
 
 # =========================
 # BUY
@@ -206,10 +246,12 @@ def buy(symbol, price):
         return
 
     positions[symbol] = {
+
         "entry": price,
         "size": size,
         "peak": price,
         "time": time.time()
+
     }
 
     balance -= size
@@ -217,7 +259,7 @@ def buy(symbol, price):
     send_telegram(
         f"BUY {symbol}\n"
         f"Size ${size:.2f}\n"
-        f"Balance ${balance:.2f}"
+        f"Cash ${balance:.2f}"
     )
 
 # =========================
@@ -230,20 +272,20 @@ def sell(symbol, price, reason):
 
     pos = positions[symbol]
 
-    profit = (price - pos["entry"]) / pos["entry"]
+    profit_pct = (price - pos["entry"]) / pos["entry"]
 
-    usd = pos["size"] * (1 + profit)
+    usd = pos["size"] * (1 + profit_pct)
 
     balance += usd
 
     learning["trade_count"] += 1
 
-    if profit > 0:
+    if profit_pct > 0:
         learning["win_count"] += 1
     else:
         learning["loss_count"] += 1
 
-    learning["total_profit"] += profit
+    learning["total_profit"] += profit_pct
 
     save_learning()
 
@@ -254,17 +296,21 @@ def sell(symbol, price, reason):
             np.random.random(),
             np.random.random()
         ],
-        profit
+        profit_pct
     )
 
     del positions[symbol]
 
-    winrate = learning["win_count"] / learning["trade_count"] * 100
+    winrate = (
+        learning["win_count"] /
+        learning["trade_count"] * 100
+    )
 
     send_telegram(
         f"SELL {symbol} ({reason})\n"
-        f"Profit {profit*100:.2f}%\n"
-        f"Balance ${balance:.2f}\n\n"
+        f"P/L {profit_pct*100:.2f}%\n"
+        f"Cash ${balance:.2f}\n"
+        f"Equity ${calculate_equity():.2f}\n\n"
         f"Trades {learning['trade_count']}\n"
         f"Wins {learning['win_count']}\n"
         f"Losses {learning['loss_count']}\n"
@@ -272,14 +318,18 @@ def sell(symbol, price, reason):
     )
 
 # =========================
-# MAIN LOOP
+# START
 # =========================
 
 symbols = get_symbols()
 
 train_model()
 
-print("BOT STARTED")
+send_telegram("BOT STARTED")
+
+# =========================
+# MAIN LOOP
+# =========================
 
 while True:
 
@@ -287,7 +337,8 @@ while True:
 
         now = time.time()
 
-        # BUY LOGIC
+        # BUY LOOP
+
         for symbol in symbols:
 
             if symbol in positions:
@@ -299,9 +350,11 @@ while True:
                 continue
 
             if np.random.random() > 0.98:
+
                 buy(symbol, price)
 
-        # SELL LOGIC
+        # SELL LOOP
+
         for symbol in list(positions.keys()):
 
             price = get_price(symbol)
@@ -316,44 +369,71 @@ while True:
             if price > pos["peak"]:
                 pos["peak"] = price
 
-            drawdown = (pos["peak"] - price) / pos["peak"]
+            drawdown = (
+                pos["peak"] - price
+            ) / pos["peak"]
 
-            age_min = (now - pos["time"]) / 60
+            age_min = (
+                now - pos["time"]
+            ) / 60
 
             if profit <= -STOP_LOSS_PERCENT / 100:
+
                 sell(symbol, price, "STOP")
 
-            elif profit >= TRAILING_START_PERCENT / 100 and drawdown >= TRAILING_DISTANCE_PERCENT / 100:
+            elif (
+                profit >= TRAILING_START_PERCENT / 100 and
+                drawdown >= TRAILING_DISTANCE_PERCENT / 100
+            ):
+
                 sell(symbol, price, "TRAIL")
 
-            elif age_min >= MAX_TRADE_DURATION_MINUTES and profit <= 0:
+            elif (
+                age_min >= MAX_TRADE_DURATION_MINUTES and
+                profit <= 0
+            ):
+
                 sell(symbol, price, "STAGNATION")
 
         # STATUS
+
         if now - last_status_time > STATUS_INTERVAL:
 
-            last_status_time = now
+            equity = calculate_equity()
+
+            unrealized = equity - balance
+
+            net = equity - START_BALANCE
 
             winrate = 0
+
             if learning["trade_count"] > 0:
-                winrate = learning["win_count"] / learning["trade_count"] * 100
+
+                winrate = (
+                    learning["win_count"] /
+                    learning["trade_count"] * 100
+                )
 
             send_telegram(
                 f"STATUS\n"
                 f"Cash ${balance:.2f}\n"
-                f"Open {len(positions)}\n"
+                f"Equity ${equity:.2f}\n"
+                f"Unrealized ${unrealized:.2f}\n"
+                f"Net P/L ${net:.2f}\n"
+                f"Open {len(positions)}\n\n"
                 f"Trades {learning['trade_count']}\n"
                 f"Wins {learning['win_count']}\n"
                 f"Losses {learning['loss_count']}\n"
-                f"Winrate {winrate:.1f}%\n"
-                f"Profit {learning['total_profit']*100:.2f}%"
+                f"Winrate {winrate:.1f}%"
             )
+
+            last_status_time = now
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
 
-        print("ERROR", str(e))
+        print("ERROR", e)
 
         send_telegram(f"ERROR {str(e)}")
 
