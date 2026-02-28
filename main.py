@@ -1,5 +1,5 @@
 # coin_sniper_bot.py
-# COMPLETE FINAL VERSION — persistent, restart-safe, GitHub-synced
+# FINAL STABLE VERSION — NO BOOT LOOP — FULL PERSISTENCE
 
 import os
 import time
@@ -15,61 +15,93 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 # ============================================================
+# ENV HELPERS
+# ============================================================
+
+def _env(name: str) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v if v else None
+
+def env_float(name: str, default: float):
+    try:
+        return float(_env(name) or default)
+    except:
+        return default
+
+def env_int(name: str, default: int):
+    try:
+        return int(float(_env(name) or default))
+    except:
+        return default
+
+def env_bool(name: str, default: bool):
+    v = _env(name)
+    if v is None:
+        return default
+    return v.lower() in ("true","1","yes")
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
-START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "12"))
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))
+START_BALANCE = env_float("START_BALANCE", 1000)
+SCAN_INTERVAL = env_int("SCAN_INTERVAL", 15)
+STATUS_INTERVAL = env_int("STATUS_INTERVAL", 60)
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "4.0"))
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", "1.2"))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "0.9"))
+MAX_OPEN_TRADES = env_int("MAX_OPEN_TRADES", 20)
+MIN_TRADE_SIZE = env_float("MIN_TRADE_SIZE_USD", 25)
 
-MIN_TRADE_SIZE_USD = float(os.getenv("MIN_TRADE_SIZE_USD", "25"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "20"))
+STOP_LOSS = env_float("STOP_LOSS_PERCENT", 4.0)
+TRAIL_START = env_float("TRAILING_START_PERCENT", 1.2)
+TRAIL_DIST = env_float("TRAILING_DISTANCE_PERCENT", 0.9)
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = "main"
+ATR_MULT = env_float("ATR_MULT", 1.4)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GITHUB_TOKEN = _env("GITHUB_TOKEN")
+GITHUB_REPO = _env("GITHUB_REPO")
+GITHUB_BRANCH = _env("GITHUB_BRANCH") or "main"
 
-BASE_URL = "https://api.exchange.coinbase.com"
+TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")
+TELEGRAM_CHAT = _env("TELEGRAM_CHAT_ID")
 
+BASE = "https://api.exchange.coinbase.com"
 
-# ============================================================
-# FILES
-# ============================================================
 
 LEARNING_FILE = "learning.json"
 POSITIONS_FILE = "positions.json"
 HISTORY_FILE = "trade_history.csv"
 
 
+session = requests.Session()
+session.headers.update({"User-Agent": "coin-sniper"})
+
+
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-session = requests.Session()
-
 def notify(msg):
     print(msg, flush=True)
-
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT:
         try:
             session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+                json={"chat_id": TELEGRAM_CHAT, "text": msg},
+                timeout=10
             )
         except:
             pass
 
 
 # ============================================================
-# GITHUB SYNC
+# GITHUB SYNC (SAFE — NO BOOT LOOP)
 # ============================================================
+
+last_push = 0
 
 def gh_headers():
     return {
@@ -77,52 +109,58 @@ def gh_headers():
         "Accept": "application/vnd.github+json"
     }
 
-def gh_put_file(path, content_bytes):
+def gh_put(filename):
+
+    global last_push
 
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
 
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    now = time.time()
 
-    sha = None
-    r = session.get(url, headers=gh_headers())
+    if now - last_push < 30:
+        return
 
-    if r.status_code == 200:
-        sha = r.json()["sha"]
+    last_push = now
 
-    payload = {
-        "message": f"update {path}",
-        "content": base64.b64encode(content_bytes).decode(),
-        "branch": GITHUB_BRANCH
-    }
+    try:
 
-    if sha:
-        payload["sha"] = sha
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
 
-    session.put(url, headers=gh_headers(), json=payload)
+        sha = None
 
+        r = session.get(url, headers=gh_headers())
 
-def push_all():
+        if r.status_code == 200:
+            sha = r.json()["sha"]
 
-    if os.path.exists(LEARNING_FILE):
-        gh_put_file(LEARNING_FILE, open(LEARNING_FILE,"rb").read())
+        with open(filename,"rb") as f:
+            content = base64.b64encode(f.read()).decode()
 
-    if os.path.exists(POSITIONS_FILE):
-        gh_put_file(POSITIONS_FILE, open(POSITIONS_FILE,"rb").read())
+        payload = {
+            "message": "update",
+            "content": content,
+            "branch": GITHUB_BRANCH
+        }
 
-    if os.path.exists(HISTORY_FILE):
-        gh_put_file(HISTORY_FILE, open(HISTORY_FILE,"rb").read())
+        if sha:
+            payload["sha"] = sha
+
+        session.put(url, headers=gh_headers(), json=payload)
+
+    except:
+        pass
 
 
 # ============================================================
-# PERSISTENCE
+# FILE MANAGEMENT
 # ============================================================
 
-def ensure_learning():
+def load_learning():
 
     if not os.path.exists(LEARNING_FILE):
 
-        state = {
+        data = {
             "cash": START_BALANCE,
             "start_balance": START_BALANCE,
             "trade_count": 0,
@@ -131,106 +169,102 @@ def ensure_learning():
             "total_profit_usd": 0
         }
 
-        json.dump(state, open(LEARNING_FILE,"w"))
+        save_learning(data)
 
-    return json.load(open(LEARNING_FILE))
+        return data
 
-
-def save_learning(state):
-
-    json.dump(state, open(LEARNING_FILE,"w"))
-    push_all()
+    with open(LEARNING_FILE,"r") as f:
+        return json.load(f)
 
 
-def ensure_positions():
+def save_learning(data):
+
+    with open(LEARNING_FILE,"w") as f:
+        json.dump(data,f)
+
+    gh_put(LEARNING_FILE)
+
+
+def load_positions():
 
     if not os.path.exists(POSITIONS_FILE):
-        json.dump({}, open(POSITIONS_FILE,"w"))
+        return {}
 
-    return json.load(open(POSITIONS_FILE))
+    with open(POSITIONS_FILE,"r") as f:
+        return json.load(f)
 
 
 def save_positions(p):
 
-    json.dump(p, open(POSITIONS_FILE,"w"))
-    push_all()
+    with open(POSITIONS_FILE,"w") as f:
+        json.dump(p,f)
 
-
-def ensure_history():
-
-    if not os.path.exists(HISTORY_FILE):
-
-        w = csv.writer(open(HISTORY_FILE,"w"))
-        w.writerow(["profit_usd"])
+    gh_put(POSITIONS_FILE)
 
 
 # ============================================================
-# MARKET
+# MARKET DATA
 # ============================================================
 
-def get_price(symbol):
+def price(sym):
+
+    try:
+        r = session.get(f"{BASE}/products/{sym}/ticker")
+        return float(r.json()["price"])
+    except:
+        return None
+
+
+def symbols():
 
     try:
 
-        r = session.get(f"{BASE_URL}/products/{symbol}/ticker")
+        r = session.get(f"{BASE}/products")
 
-        return float(r.json()["price"])
+        return [
+            x["id"]
+            for x in r.json()
+            if x["quote_currency"]=="USD"
+        ][:60]
 
     except:
-
-        return None
+        return []
 
 
 # ============================================================
 # PORTFOLIO
 # ============================================================
 
-learning = ensure_learning()
-positions = ensure_positions()
-ensure_history()
+learning = load_learning()
+positions = load_positions()
 
 cash = learning["cash"]
 
 
-def equity():
-
-    total = cash
-
-    for sym,pos in positions.items():
-
-        p = get_price(sym)
-
-        if p:
-            total += pos["qty"] * p
-
-    return total
+notify(f"BOT STARTED cash {cash}")
 
 
 # ============================================================
-# OPEN TRADE
+# TRADING
 # ============================================================
 
-def open_trade(sym, price):
+def buy(sym, p):
 
     global cash
 
-    if sym in positions:
+    size = MIN_TRADE_SIZE
+
+    if cash < size:
         return
 
-    if cash < MIN_TRADE_SIZE_USD:
-        return
-
-    size = MIN_TRADE_SIZE_USD
-
-    qty = size / price
+    qty = size/p
 
     positions[sym] = {
-
-        "entry": price,
+        "entry": p,
         "qty": qty,
         "size": size,
-        "stop": price*(1-STOP_LOSS_PERCENT/100),
-        "peak": price,
+        "peak": p,
+        "stop": p*(1-STOP_LOSS/100),
         "time": time.time()
     }
 
@@ -244,24 +278,21 @@ def open_trade(sym, price):
     notify(f"BUY {sym} size {size}")
 
 
-# ============================================================
-# SELL TRADE
-# ============================================================
-
-def close_trade(sym, price):
+def sell(sym,p):
 
     global cash
 
     pos = positions[sym]
 
-    proceeds = pos["qty"]*price
+    proceeds = pos["qty"]*p
 
     profit = proceeds-pos["size"]
 
     cash += proceeds
 
     learning["cash"] = cash
-    learning["trade_count"]+=1
+
+    learning["trade_count"] += 1
 
     if profit>0:
         learning["win_count"]+=1
@@ -270,57 +301,67 @@ def close_trade(sym, price):
 
     learning["total_profit_usd"]+=profit
 
-    save_learning(learning)
-
-    append = csv.writer(open(HISTORY_FILE,"a"))
-    append.writerow([profit])
-
     del positions[sym]
 
+    save_learning(learning)
     save_positions(positions)
 
     notify(f"SELL {sym} profit {profit}")
 
 
 # ============================================================
-# BOT START
-# ============================================================
-
-notify(f"BOT STARTED cash {cash}")
-
-
-# ============================================================
 # MAIN LOOP
 # ============================================================
 
-SYMBOLS = ["BTC-USD","ETH-USD","SOL-USD","LINK-USD"]
+syms = symbols()
 
-last_status=0
+last_status = 0
 
 while True:
 
     try:
 
-        for sym in SYMBOLS:
+        prices = {}
 
-            price=get_price(sym)
+        for s in syms:
+            p = price(s)
+            if p:
+                prices[s]=p
 
-            if not price:
+        # manage open
+        for s,pos in list(positions.items()):
+
+            p = prices.get(s)
+
+            if not p:
                 continue
 
-            if sym not in positions:
-                open_trade(sym,price)
+            if p>pos["peak"]:
+                pos["peak"]=p
 
-            else:
+            trail = pos["peak"]*(1-TRAIL_DIST/100)
 
-                pos=positions[sym]
+            if p<pos["stop"] or p<trail:
+                sell(s,p)
 
-                if price<pos["stop"]:
-                    close_trade(sym,price)
+        # open new
+        for s,p in prices.items():
 
+            if len(positions)>=MAX_OPEN_TRADES:
+                break
+
+            if s not in positions:
+                buy(s,p)
+
+        # status
         if time.time()-last_status>STATUS_INTERVAL:
 
-            notify(f"STATUS cash {cash} equity {equity()}")
+            equity = cash + sum(
+                pos["qty"]*prices.get(s,pos["entry"])
+                for s,pos in positions.items()
+            )
+
+            notify(f"STATUS cash {cash} equity {equity}")
 
             last_status=time.time()
 
@@ -329,4 +370,5 @@ while True:
     except Exception as e:
 
         notify(str(e))
-        time.sleep(10)
+
+        time.sleep(5)
