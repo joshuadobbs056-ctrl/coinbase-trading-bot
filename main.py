@@ -41,7 +41,46 @@ CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", 60))
 
 ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", 50))
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 BASE_URL = "https://api.exchange.coinbase.com"
+
+#########################################
+# TELEGRAM
+#########################################
+
+session = requests.Session()
+
+def notify(msg):
+
+    print(msg, flush=True)
+
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+
+        try:
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+            session.post(
+
+                url,
+
+                json={
+
+                    "chat_id": TELEGRAM_CHAT_ID,
+
+                    "text": msg
+
+                },
+
+                timeout=10
+
+            )
+
+        except Exception as e:
+
+            print("Telegram error:", e)
 
 #########################################
 # FILES
@@ -51,13 +90,7 @@ LEARNING_FILE = "learning.json"
 HISTORY_FILE = "trade_history.csv"
 
 #########################################
-# SESSION
-#########################################
-
-session = requests.Session()
-
-#########################################
-# LEARNING STATE
+# LEARNING
 #########################################
 
 def load_learning():
@@ -101,6 +134,7 @@ if not os.path.exists(HISTORY_FILE):
         writer = csv.writer(f)
 
         writer.writerow([
+
             "rsi",
             "volume_ratio",
             "trend_strength",
@@ -109,7 +143,7 @@ if not os.path.exists(HISTORY_FILE):
         ])
 
 #########################################
-# AUTO COIN DISCOVERY
+# AUTO COINS
 #########################################
 
 def get_auto_coins():
@@ -124,7 +158,7 @@ def get_auto_coins():
 
         for p in data:
 
-            if p.get("quote_currency") == "USD" and p.get("status") == "online":
+            if p.get("quote_currency") == "USD":
 
                 coins.append(p["id"])
 
@@ -132,7 +166,7 @@ def get_auto_coins():
 
     except:
 
-        return ["BTC-USD", "ETH-USD", "SOL-USD"]
+        return ["BTC-USD", "ETH-USD"]
 
 if COINS == "AUTO":
 
@@ -273,70 +307,11 @@ def score_trade(rsi, vol, trend, mom):
     score = 0
 
     if 55 <= rsi <= 75: score += 1
-
     if vol > 1.2: score += 1
-
     if trend > 0: score += 1
-
     if mom > 0: score += 1
 
     return score
-
-#########################################
-# ML MODEL
-#########################################
-
-model = None
-
-def train_model():
-
-    global model
-
-    try:
-
-        data = np.loadtxt(
-
-            HISTORY_FILE,
-
-            delimiter=",",
-
-            skiprows=1
-
-        )
-
-        if len(data) < ML_MIN_TRADES:
-
-            return
-
-        X = data[:, :-1]
-
-        y = (data[:, -1] > 0).astype(int)
-
-        model = RandomForestClassifier(n_estimators=200)
-
-        model.fit(X, y)
-
-        print("ML TRAINED")
-
-    except:
-
-        pass
-
-def ml_allows(features):
-
-    if model is None:
-
-        return True
-
-    try:
-
-        prob = model.predict_proba([features])[0][1]
-
-        return prob >= 0.55
-
-    except:
-
-        return True
 
 #########################################
 # PORTFOLIO
@@ -386,22 +361,22 @@ def close_trade(t, price, reason):
 
     save_learning()
 
-    with open(HISTORY_FILE, "a", newline="") as f:
+    notify(
 
-        writer = csv.writer(f)
+        f"SELL {t['sym']} ({reason})\n"
 
-        writer.writerow([
-            t["rsi"],
-            t["vol"],
-            t["trend"],
-            t["mom"],
-            profit
-        ])
+        f"Entry {t['entry']:.6f}\n"
 
-    print("SELL", t["sym"], reason, "Profit", round(profit, 4), "Cash", round(cash, 2))
+        f"Exit {price:.6f}\n"
+
+        f"Profit {profit:.4f}\n"
+
+        f"Balance {cash:.2f}"
+
+    )
 
 #########################################
-# OPEN TRADE—all FIXED VERSION
+# OPEN TRADE
 #########################################
 
 def open_trade(sym, price, score, features):
@@ -430,11 +405,6 @@ def open_trade(sym, price, score, features):
         "score": score,
         "time": time.time(),
 
-        "rsi": features[0],
-        "vol": features[1],
-        "trend": features[2],
-        "mom": features[3],
-
         "stop": price * (1 - STOP_LOSS_PERCENT / 100),
         "peak": price,
         "trail": None,
@@ -444,10 +414,20 @@ def open_trade(sym, price, score, features):
 
     open_trades.append(trade)
 
-    print("BUY", sym, "Score", score, "Cash", round(cash, 2))
+    notify(
+
+        f"BUY {sym}\n"
+
+        f"Price {price:.6f}\n"
+
+        f"Score {score}\n"
+
+        f"Balance {cash:.2f}"
+
+    )
 
 #########################################
-# MANAGE TRADES (STAGNATION FIXED)
+# MANAGE TRADES
 #########################################
 
 def manage_trades(prices):
@@ -484,7 +464,6 @@ def manage_trades(prices):
 
         profit_pct = (p - t["entry"]) / t["entry"] * 100
 
-        # FIXED LOGIC
         if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
 
             close_trade(t, p, "STAGNATION")
@@ -511,9 +490,7 @@ def manage_trades(prices):
 # MAIN LOOP
 #########################################
 
-print("BOT STARTED")
-
-train_model()
+notify("COIN SNIPER STARTED")
 
 last_status = time.time()
 
@@ -560,24 +537,29 @@ while True:
             vols = [c[5] for c in candles]
 
             rsi = calc_rsi(closes)
-
             vol = volume_ratio(vols)
-
             trend = trend_strength(closes)
-
             mom = momentum(closes)
 
             score = score_trade(rsi, vol, trend, mom)
 
-            features = [rsi, vol, trend, mom]
+            if score >= MIN_SCORE:
 
-            if score >= MIN_SCORE and ml_allows(features):
-
-                open_trade(sym, prices[sym], score, features)
+                open_trade(sym, prices[sym], score, [rsi, vol, trend, mom])
 
         if time.time() - last_status > STATUS_INTERVAL:
 
-            print("STATUS Cash", round(cash, 2), "Open", len(open_trades))
+            notify(
+
+                f"STATUS\n"
+
+                f"Balance {cash:.2f}\n"
+
+                f"Open trades {len(open_trades)}\n"
+
+                f"Profit {learning['total_profit']:.2f}"
+
+            )
 
             last_status = time.time()
 
@@ -585,6 +567,6 @@ while True:
 
     except Exception as e:
 
-        print("ERROR", str(e))
+        notify(f"ERROR {e}")
 
         time.sleep(5)
