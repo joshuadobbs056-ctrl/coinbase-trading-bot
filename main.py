@@ -3,43 +3,37 @@ import time
 import json
 import csv
 import requests
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 
 #########################################
 # VARIABLES
 #########################################
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
 
 COINS = os.getenv("COINS", "AUTO")
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 120))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 200))
 
 START_BALANCE = float(os.getenv("START_BALANCE", 1000))
 
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 30))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 50))
 
-MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 1))
-MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 5))
+MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 0.5))
 
-MIN_CASH_RESERVE_PERCENT = float(os.getenv("MIN_CASH_RESERVE_PERCENT", 2))
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 1.8))
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 2.0))
+TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.18))
+TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.12))
 
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.25))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.20))
+MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 12))
 
-MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 20))
+MIN_SCORE = float(os.getenv("MIN_SCORE", 2))
 
-MIN_SCORE = float(os.getenv("MIN_SCORE", 2.0))
-
-CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", 60))
-CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", 60))
-
-ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", 50))
+CANDLE_GRANULARITY = 60
+CANDLE_POINTS = 60
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -60,87 +54,50 @@ def notify(msg):
 
         try:
 
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
             session.post(
 
-                url,
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
 
-                json={
-
-                    "chat_id": TELEGRAM_CHAT_ID,
-
-                    "text": msg
-
-                },
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
 
                 timeout=10
 
             )
 
-        except Exception as e:
+        except:
 
-            print("Telegram error:", e)
+            pass
 
 #########################################
-# FILES
+# LEARNING STATE
 #########################################
 
 LEARNING_FILE = "learning.json"
-HISTORY_FILE = "trade_history.csv"
-
-#########################################
-# LEARNING
-#########################################
 
 def load_learning():
 
     if os.path.exists(LEARNING_FILE):
 
-        try:
+        with open(LEARNING_FILE,"r") as f:
 
-            with open(LEARNING_FILE, "r") as f:
-
-                return json.load(f)
-
-        except:
-
-            pass
+            return json.load(f)
 
     return {
 
-        "trade_count": 0,
-        "win_count": 0,
-        "total_profit": 0
+        "trade_count":0,
+        "win_count":0,
+        "loss_count":0,
+        "total_profit":0
 
     }
 
 def save_learning():
 
-    with open(LEARNING_FILE, "w") as f:
+    with open(LEARNING_FILE,"w") as f:
 
-        json.dump(learning, f)
+        json.dump(learning,f)
 
 learning = load_learning()
-
-#########################################
-# HISTORY FILE
-#########################################
-
-if not os.path.exists(HISTORY_FILE):
-
-    with open(HISTORY_FILE, "w", newline="") as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow([
-
-            "rsi",
-            "volume_ratio",
-            "trend_strength",
-            "momentum",
-            "profit"
-        ])
 
 #########################################
 # AUTO COINS
@@ -150,59 +107,37 @@ def get_auto_coins():
 
     try:
 
-        r = session.get(f"{BASE_URL}/products", timeout=15)
+        r=session.get(f"{BASE_URL}/products",timeout=15)
 
-        data = r.json()
+        data=r.json()
 
-        coins = []
-
-        for p in data:
-
-            if p.get("quote_currency") == "USD":
-
-                coins.append(p["id"])
+        coins=[p["id"] for p in data if p.get("quote_currency")=="USD"]
 
         return coins[:MAX_SYMBOLS]
 
     except:
 
-        return ["BTC-USD", "ETH-USD"]
+        return ["BTC-USD","ETH-USD"]
 
-if COINS == "AUTO":
-
-    COIN_LIST = get_auto_coins()
-
-else:
-
-    COIN_LIST = COINS.split(",")
+COIN_LIST = get_auto_coins() if COINS=="AUTO" else COINS.split(",")
 
 #########################################
 # MARKET DATA
 #########################################
 
-def get_ticker(sym):
+def get_price(sym):
 
     try:
 
-        r = session.get(
+        r=session.get(f"{BASE_URL}/products/{sym}/ticker",timeout=10)
 
-            f"{BASE_URL}/products/{sym}/ticker",
-
-            timeout=10
-
-        )
-
-        if r.status_code != 200:
-
-            return None
-
-        data = r.json()
+        data=r.json()
 
         if "price" not in data:
 
             return None
 
-        return data
+        return float(data["price"])
 
     except:
 
@@ -212,25 +147,17 @@ def get_candles(sym):
 
     try:
 
-        r = session.get(
+        r=session.get(
 
             f"{BASE_URL}/products/{sym}/candles",
 
-            params={"granularity": CANDLE_GRANULARITY},
+            params={"granularity":CANDLE_GRANULARITY},
 
             timeout=10
 
         )
 
-        if r.status_code != 200:
-
-            return None
-
-        data = r.json()
-
-        if not isinstance(data, list):
-
-            return None
+        data=r.json()
 
         data.reverse()
 
@@ -244,329 +171,251 @@ def get_candles(sym):
 # INDICATORS
 #########################################
 
-def calc_rsi(closes):
+def rsi(closes):
 
-    if len(closes) < 15:
+    if len(closes)<15: return 50
 
-        return 50
+    d=np.diff(closes)
 
-    deltas = np.diff(closes)
+    gain=np.maximum(d,0)
 
-    gains = np.maximum(deltas, 0)
+    loss=-np.minimum(d,0)
 
-    losses = -np.minimum(deltas, 0)
+    ag=np.mean(gain[-14:])
+    al=np.mean(loss[-14:])
 
-    avg_gain = np.mean(gains[-14:])
+    if al==0: return 100
 
-    avg_loss = np.mean(losses[-14:])
+    rs=ag/al
 
-    if avg_loss == 0:
+    return 100-(100/(1+rs))
 
-        return 100
+def trend(closes):
 
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
-
-def ema(vals, period=20):
-
-    if len(vals) < period:
-
-        return np.mean(vals)
-
-    k = 2 / (period + 1)
-
-    e = vals[0]
-
-    for v in vals:
-
-        e = v * k + e * (1 - k)
-
-    return e
-
-def trend_strength(closes):
-
-    e = ema(closes)
-
-    return (closes[-1] - e) / e
+    return (closes[-1]-np.mean(closes[-20:]))/closes[-20]
 
 def momentum(closes):
 
-    return (closes[-1] - closes[-5]) / closes[-5]
+    return (closes[-1]-closes[-5])/closes[-5]
 
-def volume_ratio(vols):
+def vol_ratio(vols):
 
-    return vols[-1] / np.mean(vols[-20:])
+    return vols[-1]/np.mean(vols[-20:])
 
 #########################################
-# SCORING
+# SCORE
 #########################################
 
-def score_trade(rsi, vol, trend, mom):
+def score(r,v,t,m):
 
-    score = 0
+    s=0
 
-    if 55 <= rsi <= 75: score += 1
-    if vol > 1.2: score += 1
-    if trend > 0: score += 1
-    if mom > 0: score += 1
+    if r>55: s+=1
+    if v>1.1: s+=1
+    if t>0: s+=1
+    if m>0: s+=1
 
-    return score
+    return s
 
 #########################################
 # PORTFOLIO
 #########################################
 
-cash = START_BALANCE
-
-open_trades = []
+cash=START_BALANCE
+open_trades=[]
 
 #########################################
 # POSITION SIZE
 #########################################
 
-def reserve():
-
-    return cash * (MIN_CASH_RESERVE_PERCENT / 100)
-
 def position_size():
 
-    percent = MIN_POSITION_SIZE_PERCENT
-
-    size = cash * (percent / 100)
-
-    return min(size, cash - reserve())
+    return cash*(MIN_POSITION_SIZE_PERCENT/100)
 
 #########################################
-# CLOSE TRADE
+# CLOSE TRADE WITH WIN/LOSS STATS
 #########################################
 
-def close_trade(t, price, reason):
+def close_trade(t,price,reason):
 
     global cash
 
-    proceeds = t["qty"] * price
+    proceeds=t["qty"]*price
 
-    profit = proceeds - (t["qty"] * t["entry"])
+    profit=proceeds-(t["qty"]*t["entry"])
 
-    cash += proceeds
+    cash+=proceeds
 
-    learning["trade_count"] += 1
+    learning["trade_count"]+=1
+    learning["total_profit"]+=profit
 
-    learning["total_profit"] += profit
-
-    if profit > 0:
-
-        learning["win_count"] += 1
+    if profit>0:
+        learning["win_count"]+=1
+    else:
+        learning["loss_count"]+=1
 
     save_learning()
 
+    trades=learning["trade_count"]
+    wins=learning["win_count"]
+    losses=learning["loss_count"]
+
+    winrate=(wins/trades)*100 if trades>0 else 0
+
     notify(
+f"""SELL {t['sym']} ({reason})
+Profit: {profit:.4f}
+Balance: {cash:.2f}
 
-        f"SELL {t['sym']} ({reason})\n"
-
-        f"Entry {t['entry']:.6f}\n"
-
-        f"Exit {price:.6f}\n"
-
-        f"Profit {profit:.4f}\n"
-
-        f"Balance {cash:.2f}"
-
-    )
+Trades: {trades}
+Wins: {wins}
+Losses: {losses}
+Winrate: {winrate:.1f}%"""
+)
 
 #########################################
 # OPEN TRADE
 #########################################
 
-def open_trade(sym, price, score, features):
+def open_trade(sym,price):
 
     global cash
 
-    if len(open_trades) >= MAX_OPEN_TRADES:
+    if len(open_trades)>=MAX_OPEN_TRADES: return
 
-        return
+    size=position_size()
 
-    size = position_size()
+    if size<=0: return
 
-    if size <= 0:
+    qty=size/price
 
-        return
+    cash-=size
 
-    qty = size / price
+    trade={
 
-    cash -= size
-
-    trade = {
-
-        "sym": sym,
-        "entry": price,
-        "qty": qty,
-        "score": score,
-        "time": time.time(),
-
-        "stop": price * (1 - STOP_LOSS_PERCENT / 100),
-        "peak": price,
-        "trail": None,
-        "trailing_active": False
+        "sym":sym,
+        "entry":price,
+        "qty":qty,
+        "time":time.time(),
+        "peak":price,
+        "trail":None,
+        "active":False,
+        "stop":price*(1-STOP_LOSS_PERCENT/100)
 
     }
 
     open_trades.append(trade)
 
-    notify(
-
-        f"BUY {sym}\n"
-
-        f"Price {price:.6f}\n"
-
-        f"Score {score}\n"
-
-        f"Balance {cash:.2f}"
-
-    )
+    notify(f"BUY {sym} | Balance {cash:.2f}")
 
 #########################################
-# MANAGE TRADES
+# MANAGE
 #########################################
 
-def manage_trades(prices):
+def manage(prices):
 
     global open_trades
 
-    remaining = []
+    remaining=[]
 
     for t in open_trades:
 
-        if t["sym"] not in prices:
+        p=prices.get(t["sym"])
 
+        if not p:
             remaining.append(t)
-
             continue
 
-        p = prices[t["sym"]]
+        if p>t["peak"]:
+            t["peak"]=p
 
-        if p > t["peak"]:
+        if not t["active"] and p>=t["entry"]*(1+TRAILING_START_PERCENT/100):
 
-            t["peak"] = p
+            t["active"]=True
 
-        if not t["trailing_active"]:
+        if t["active"]:
 
-            if p >= t["entry"] * (1 + TRAILING_START_PERCENT / 100):
+            t["trail"]=t["peak"]*(1-TRAILING_DISTANCE_PERCENT/100)
 
-                t["trailing_active"] = True
+        age=(time.time()-t["time"])/60
 
-        if t["trailing_active"]:
+        profit=(p-t["entry"])/t["entry"]*100
 
-            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT / 100)
+        if age>=MAX_TRADE_DURATION_MINUTES and profit<=0:
 
-        age_min = (time.time() - t["time"]) / 60
-
-        profit_pct = (p - t["entry"]) / t["entry"] * 100
-
-        if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
-
-            close_trade(t, p, "STAGNATION")
-
+            close_trade(t,p,"STAGNATION")
             continue
 
-        if p <= t["stop"]:
+        if p<=t["stop"]:
 
-            close_trade(t, p, "STOP")
-
+            close_trade(t,p,"STOP")
             continue
 
-        if t["trail"] and p <= t["trail"]:
+        if t["trail"] and p<=t["trail"]:
 
-            close_trade(t, p, "TRAIL")
-
+            close_trade(t,p,"TRAIL")
             continue
 
         remaining.append(t)
 
-    open_trades = remaining
+    open_trades=remaining
 
 #########################################
 # MAIN LOOP
 #########################################
 
-notify("COIN SNIPER STARTED")
+notify("SAVAGE MODE STARTED")
 
-last_status = time.time()
+last_status=time.time()
 
 while True:
 
     try:
 
-        prices = {}
+        prices={}
 
         for sym in COIN_LIST:
 
-            tick = get_ticker(sym)
+            price=get_price(sym)
 
-            if tick and "price" in tick:
+            if price:
+                prices[sym]=price
 
-                try:
+        manage(prices)
 
-                    prices[sym] = float(tick["price"])
-
-                except:
-
-                    continue
-
-        manage_trades(prices)
-
-        for sym in COIN_LIST:
-
-            if sym not in prices:
-
-                continue
+        for sym,price in prices.items():
 
             if sym in [t["sym"] for t in open_trades]:
-
                 continue
 
-            candles = get_candles(sym)
+            candles=get_candles(sym)
 
             if not candles:
-
                 continue
 
-            closes = [c[4] for c in candles]
+            closes=[c[4] for c in candles]
+            vols=[c[5] for c in candles]
 
-            vols = [c[5] for c in candles]
-
-            rsi = calc_rsi(closes)
-            vol = volume_ratio(vols)
-            trend = trend_strength(closes)
-            mom = momentum(closes)
-
-            score = score_trade(rsi, vol, trend, mom)
-
-            if score >= MIN_SCORE:
-
-                open_trade(sym, prices[sym], score, [rsi, vol, trend, mom])
-
-        if time.time() - last_status > STATUS_INTERVAL:
-
-            notify(
-
-                f"STATUS\n"
-
-                f"Balance {cash:.2f}\n"
-
-                f"Open trades {len(open_trades)}\n"
-
-                f"Profit {learning['total_profit']:.2f}"
-
+            sc=score(
+                rsi(closes),
+                vol_ratio(vols),
+                trend(closes),
+                momentum(closes)
             )
 
-            last_status = time.time()
+            if sc>=MIN_SCORE:
+
+                open_trade(sym,price)
+
+        if time.time()-last_status>STATUS_INTERVAL:
+
+            notify(f"STATUS Balance {cash:.2f} Open {len(open_trades)}")
+
+            last_status=time.time()
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
 
         notify(f"ERROR {e}")
-
         time.sleep(5)
