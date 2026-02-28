@@ -2,464 +2,486 @@ import os
 import time
 import json
 import csv
+import base64
 import requests
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 #########################################
-# VARIABLES (Railway)
+# CONFIG
 #########################################
 
-COINS = os.getenv("COINS", "AUTO")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 120))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 200))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 50))
+COINS = os.getenv("COINS", "AUTO")
 
-MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 0.5))
-MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 3))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 12))
 
-MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 25))
+MIN_SCORE = float(os.getenv("MIN_SCORE", 3))
+
+MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 3))
+MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 8))
+MIN_POSITION_SIZE_USD = float(os.getenv("MIN_POSITION_SIZE_USD", 25))
 
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 1.4))
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.35))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.20))
 
-MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 12))
-MIN_SCORE = float(os.getenv("MIN_SCORE", 2))
+TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.5))
+TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.3))
+
+MAX_TRADE_DURATION_MINUTES = int(os.getenv("MAX_TRADE_DURATION_MINUTES", 30))
+
+MIN_CASH_RESERVE_PERCENT = float(os.getenv("MIN_CASH_RESERVE_PERCENT", 20))
 
 START_BALANCE = float(os.getenv("START_BALANCE", 1000))
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 BASE_URL = "https://api.exchange.coinbase.com"
 
-LEARNING_FILE = "learning.json"
-HISTORY_FILE = "trade_history.csv"
+#########################################
+# GITHUB STORAGE
+#########################################
+
+def github_get_file(path, default):
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
+    r = requests.get(url, headers=headers)
+
+    if r.status_code == 200:
+
+        data = r.json()
+
+        content = base64.b64decode(data["content"]).decode()
+
+        return json.loads(content), data["sha"]
+
+    return default, None
+
+
+def github_save_file(path, data, sha=None):
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+
+    content = base64.b64encode(json.dumps(data, indent=2).encode()).decode()
+
+    payload = {
+
+        "message": "bot update",
+
+        "content": content,
+
+        "branch": GITHUB_BRANCH
+
+    }
+
+    if sha:
+
+        payload["sha"] = sha
+
+    requests.put(url, headers=headers, json=payload)
+
+#########################################
+# LOAD STATE
+#########################################
+
+state, state_sha = github_get_file(
+
+    "state.json",
+
+    {
+
+        "cash": START_BALANCE,
+
+        "trade_count": 0,
+
+        "win_count": 0,
+
+        "loss_count": 0,
+
+        "total_profit": 0
+
+    }
+
+)
+
+cash = state["cash"]
+
+trade_count = state["trade_count"]
+
+win_count = state["win_count"]
+
+loss_count = state["loss_count"]
+
+total_profit = state["total_profit"]
+
+#########################################
+# TRADE HISTORY FOR ML
+#########################################
+
+history, history_sha = github_get_file("learning.json", [])
+
+model = None
+
+ml_active = False
 
 #########################################
 # TELEGRAM
 #########################################
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
 def notify(msg):
+
     print(msg, flush=True)
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+
         try:
+
             requests.post(
+
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10
+
+                json={
+
+                    "chat_id": TELEGRAM_CHAT_ID,
+
+                    "text": msg
+
+                }
+
             )
+
         except:
+
             pass
 
 #########################################
-# LEARNING FILE
+# ML TRAINING
 #########################################
-
-def load_learning():
-    data = {}
-
-    if os.path.exists(LEARNING_FILE):
-        with open(LEARNING_FILE, "r") as f:
-            data = json.load(f)
-
-    data.setdefault("trade_count", 0)
-    data.setdefault("win_count", 0)
-    data.setdefault("loss_count", 0)
-    data.setdefault("total_profit", 0.0)
-
-    return data
-
-def save_learning():
-    with open(LEARNING_FILE, "w") as f:
-        json.dump(learning, f)
-
-learning = load_learning()
-
-#########################################
-# HISTORY FILE
-#########################################
-
-if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["rsi","volume_ratio","trend_strength","momentum","profit"])
-
-#########################################
-# ML MODEL
-#########################################
-
-model = None
 
 def train_model():
-    global model
 
-    try:
-        data = np.loadtxt(HISTORY_FILE, delimiter=",", skiprows=1)
+    global model, ml_active
 
-        if len(data.shape) < 2 or data.shape[0] < 50:
-            return
+    if len(history) < 50:
 
-        X = data[:,0:4]
-        y = data[:,4] > 0
+        return
 
-        model = RandomForestClassifier(n_estimators=200)
-        model.fit(X,y)
+    X = []
 
-        notify("ML MODEL ACTIVATED")
+    y = []
 
-    except:
-        pass
+    for row in history:
+
+        X.append(row["features"])
+
+        y.append(1 if row["profit"] > 0 else 0)
+
+    model = RandomForestClassifier(n_estimators=100)
+
+    model.fit(X, y)
+
+    ml_active = True
+
+    notify("ML MODEL ACTIVATED")
+
+
+train_model()
 
 #########################################
 # MARKET DATA
 #########################################
 
 def get_symbols():
-    try:
-        r = requests.get(BASE_URL + "/products", timeout=10)
-        data = r.json()
 
-        symbols = [
-            p["id"]
-            for p in data
-            if "-USD" in p["id"]
-            and p.get("status") == "online"
-        ]
+    if COINS != "AUTO":
 
-        return symbols[:MAX_SYMBOLS]
+        return COINS.split(",")
 
-    except:
-        return ["BTC-USD","ETH-USD"]
+    r = requests.get(f"{BASE_URL}/products")
+
+    data = r.json()
+
+    usd = [
+
+        x["id"]
+
+        for x in data
+
+        if x["quote_currency"] == "USD"
+
+    ]
+
+    return usd[:MAX_SYMBOLS]
+
 
 def get_ticker(sym):
-    try:
-        r = requests.get(BASE_URL + f"/products/{sym}/ticker", timeout=10)
-        data = r.json()
 
-        if "price" not in data:
-            return None
+    r = requests.get(f"{BASE_URL}/products/{sym}/ticker")
 
-        price = float(data["price"])
+    return r.json()
 
-        if price <= 0:
-            return None
-
-        return price
-
-    except:
-        return None
 
 def get_candles(sym):
-    try:
-        r = requests.get(
-            BASE_URL + f"/products/{sym}/candles",
-            params={"granularity":60},
-            timeout=10
-        )
 
-        data = r.json()
+    r = requests.get(
 
-        if not isinstance(data, list) or len(data) < 20:
-            return None
+        f"{BASE_URL}/products/{sym}/candles",
 
-        data.reverse()
+        params={"granularity": 60}
 
-        return data[-60:]
+    )
 
-    except:
-        return None
+    data = r.json()
+
+    data.reverse()
+
+    return data[-60:]
 
 #########################################
 # INDICATORS
 #########################################
 
-def calc_rsi(closes):
+def calc_features(candles):
 
-    if len(closes) < 15:
-        return 50
+    closes = np.array([c[4] for c in candles])
 
-    deltas = np.diff(closes)
+    volumes = np.array([c[5] for c in candles])
 
-    gains = np.maximum(deltas,0)
-    losses = -np.minimum(deltas,0)
+    rsi = np.mean(closes[-14:])
 
-    avg_gain = np.mean(gains[-14:])
-    avg_loss = np.mean(losses[-14:])
+    vol_ratio = volumes[-1] / np.mean(volumes)
 
-    if avg_loss == 0:
-        return 100
+    trend = closes[-1] - closes[-20]
 
-    rs = avg_gain / avg_loss
+    momentum = closes[-1] - closes[-5]
 
-    return 100 - (100/(1+rs))
-
-def trend_strength(closes):
-
-    avg = np.mean(closes)
-
-    if avg == 0:
-        return 0
-
-    return (closes[-1] - avg) / avg
-
-def momentum(closes):
-
-    if len(closes) < 6:
-        return 0
-
-    return (closes[-1] - closes[-5]) / closes[-5]
-
-def volume_ratio(vols):
-
-    if len(vols) < 20:
-        return 1
-
-    return vols[-1] / np.mean(vols[-20:])
+    return [rsi, vol_ratio, trend, momentum]
 
 #########################################
-# PORTFOLIO
-#########################################
-
-cash = START_BALANCE
-open_trades = []
-
-#########################################
-# POSITION SIZE WITH $25 MINIMUM + SCALING
+# POSITION SIZE
 #########################################
 
 def position_size():
 
-    if learning["trade_count"] < 50:
-        percent = MIN_POSITION_SIZE_PERCENT
-    else:
-        percent = MAX_POSITION_SIZE_PERCENT
-
-    percent_size = cash * percent / 100
-
-    size = max(percent_size, MIN_POSITION_USD)
-
-    size = min(size, cash)
-
-    return size
-
-#########################################
-# RECORD TRADE FOR ML
-#########################################
-
-def record_trade(t, profit):
-
-    with open(HISTORY_FILE, "a", newline="") as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow([
-            t["rsi"],
-            t["volume_ratio"],
-            t["trend_strength"],
-            t["momentum"],
-            profit
-        ])
-
-#########################################
-# CLOSE TRADE
-#########################################
-
-def close_trade(t, price, reason):
-
     global cash
 
-    proceeds = t["qty"] * price
-    profit = proceeds - (t["qty"] * t["entry"])
+    percent = MIN_POSITION_SIZE_PERCENT
 
-    cash += proceeds
+    size = cash * percent / 100
 
-    learning["trade_count"] += 1
-    learning["total_profit"] += profit
+    size = max(size, MIN_POSITION_SIZE_USD)
 
-    if profit > 0:
-        learning["win_count"] += 1
-    else:
-        learning["loss_count"] += 1
-
-    save_learning()
-
-    record_trade(t, profit)
-
-    winrate = learning["win_count"] / max(1, learning["trade_count"]) * 100
-
-    notify(
-f"""SELL {t['sym']} ({reason})
-Profit: {profit:.2f}
-Balance: {cash:.2f}
-
-Trades: {learning['trade_count']}
-Wins: {learning['win_count']}
-Losses: {learning['loss_count']}
-Winrate: {winrate:.1f}%"""
-)
+    return min(size, cash)
 
 #########################################
-# OPEN TRADE
+# TRADING
 #########################################
+
+open_trades = []
+
 
 def open_trade(sym, price, features):
 
     global cash
 
-    if sym not in prices:
-        return
-
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        return
-
     size = position_size()
 
-    if size <= 0 or cash < size:
+    if size < MIN_POSITION_SIZE_USD:
+
         return
 
     qty = size / price
 
     cash -= size
 
-    trade = {
-        "sym": sym,
-        "entry": price,
-        "qty": qty,
-        "time": time.time(),
-        "peak": price,
-        "stop": price * (1 - STOP_LOSS_PERCENT/100),
-        "trail": None,
-        **features
-    }
+    open_trades.append({
 
-    open_trades.append(trade)
+        "sym": sym,
+
+        "entry": price,
+
+        "qty": qty,
+
+        "peak": price,
+
+        "features": features,
+
+        "time": time.time()
+
+    })
 
     notify(f"BUY {sym} | Size ${size:.2f} | Cash ${cash:.2f}")
 
+    save_state()
+
+
+def close_trade(trade, price, reason):
+
+    global cash, trade_count, win_count, loss_count, total_profit
+
+    proceeds = trade["qty"] * price
+
+    profit = proceeds - trade["qty"] * trade["entry"]
+
+    cash += proceeds
+
+    trade_count += 1
+
+    total_profit += profit
+
+    if profit > 0:
+
+        win_count += 1
+
+    else:
+
+        loss_count += 1
+
+    history.append({
+
+        "features": trade["features"],
+
+        "profit": profit
+
+    })
+
+    notify(
+
+        f"SELL {trade['sym']} ({reason})\n"
+
+        f"Profit: {profit:.2f}\n"
+
+        f"Balance: {cash:.2f}\n"
+
+        f"Trades: {trade_count}\n"
+
+        f"Wins: {win_count}\n"
+
+        f"Losses: {loss_count}"
+
+    )
+
+    save_state()
+
+    github_save_file("learning.json", history, history_sha)
+
 #########################################
-# MANAGE TRADES
+# SAVE STATE
 #########################################
 
-def manage_trades():
+def save_state():
 
-    global open_trades
+    global state_sha
 
-    remaining = []
+    state = {
 
-    for t in open_trades:
+        "cash": cash,
 
-        sym = t["sym"]
+        "trade_count": trade_count,
 
-        if sym not in prices:
-            remaining.append(t)
-            continue
+        "win_count": win_count,
 
-        price = prices[sym]
+        "loss_count": loss_count,
 
-        if price > t["peak"]:
-            t["peak"] = price
+        "total_profit": total_profit
 
-        if price >= t["entry"] * (1 + TRAILING_START_PERCENT/100):
-            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT/100)
+    }
 
-        age_min = (time.time() - t["time"]) / 60
-        profit_pct = (price - t["entry"]) / t["entry"] * 100
-
-        if age_min >= MAX_TRADE_DURATION_MINUTES and profit_pct <= 0:
-            close_trade(t, price, "STAGNATION")
-            continue
-
-        if price <= t["stop"]:
-            close_trade(t, price, "STOP")
-            continue
-
-        if t["trail"] and price <= t["trail"]:
-            close_trade(t, price, "TRAIL")
-            continue
-
-        remaining.append(t)
-
-    open_trades = remaining
+    github_save_file("state.json", state, state_sha)
 
 #########################################
-# START
+# MAIN LOOP
 #########################################
 
 notify("BOT STARTED")
 
 symbols = get_symbols()
 
-last_status = time.time()
-last_train = time.time()
+last_status = 0
 
 while True:
 
     try:
 
-        prices = {}
+        for trade in open_trades[:]:
 
-        for sym in symbols:
+            ticker = get_ticker(trade["sym"])
 
-            price = get_ticker(sym)
+            price = float(ticker["price"])
 
-            if price is not None:
-                prices[sym] = price
+            if price > trade["peak"]:
 
-        manage_trades()
+                trade["peak"] = price
 
-        for sym in symbols:
+            trail = trade["peak"] * (1 - TRAILING_DISTANCE_PERCENT / 100)
 
-            if sym not in prices:
-                continue
+            if price <= trail:
 
-            if sym in [t["sym"] for t in open_trades]:
-                continue
+                close_trade(trade, price, "TRAIL")
 
-            candles = get_candles(sym)
+                open_trades.remove(trade)
 
-            if candles is None:
-                continue
+        if len(open_trades) < MAX_OPEN_TRADES:
 
-            closes = [c[4] for c in candles]
-            vols = [c[5] for c in candles]
+            for sym in symbols:
 
-            features = {
-                "rsi": calc_rsi(closes),
-                "volume_ratio": volume_ratio(vols),
-                "trend_strength": trend_strength(closes),
-                "momentum": momentum(closes)
-            }
+                ticker = get_ticker(sym)
 
-            score = sum([
-                features["rsi"] > 55,
-                features["volume_ratio"] > 1.2,
-                features["trend_strength"] > 0,
-                features["momentum"] > 0
-            ])
+                price = float(ticker["price"])
 
-            if score >= MIN_SCORE:
-                open_trade(sym, prices[sym], features)
+                candles = get_candles(sym)
 
-        if time.time() - last_train > 300:
-            train_model()
-            last_train = time.time()
+                features = calc_features(candles)
+
+                score = sum(features)
+
+                if ml_active:
+
+                    prob = model.predict_proba([features])[0][1]
+
+                    if prob < 0.55:
+
+                        continue
+
+                if score >= MIN_SCORE:
+
+                    open_trade(sym, price, features)
+
+                    break
 
         if time.time() - last_status > STATUS_INTERVAL:
 
             notify(
-f"""STATUS
-Cash {cash:.2f}
-Open {len(open_trades)}
-Trades {learning['trade_count']}
-Wins {learning['win_count']}
-Losses {learning['loss_count']}
-Profit {learning['total_profit']:.2f}"""
-)
+
+                f"STATUS\n"
+
+                f"Cash {cash:.2f}\n"
+
+                f"Open {len(open_trades)}\n"
+
+                f"Trades {trade_count}\n"
+
+                f"Wins {win_count}\n"
+
+                f"Losses {loss_count}\n"
+
+                f"Profit {total_profit:.2f}"
+
+            )
 
             last_status = time.time()
 
@@ -468,4 +490,5 @@ Profit {learning['total_profit']:.2f}"""
     except Exception as e:
 
         notify(f"ERROR {str(e)}")
+
         time.sleep(5)
