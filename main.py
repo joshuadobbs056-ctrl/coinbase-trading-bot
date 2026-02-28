@@ -18,9 +18,11 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 200))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 50))
 
 MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 0.5))
-MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 2))
+MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 3))
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 1.8))
+MIN_POSITION_USD = float(os.getenv("MIN_POSITION_USD", 25))
+
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 1.4))
 TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", 0.35))
 TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.20))
 
@@ -85,7 +87,7 @@ learning = load_learning()
 if not os.path.exists(HISTORY_FILE):
     with open(HISTORY_FILE, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["rsi", "volume_ratio", "trend_strength", "momentum", "profit"])
+        writer.writerow(["rsi","volume_ratio","trend_strength","momentum","profit"])
 
 #########################################
 # ML MODEL
@@ -99,14 +101,14 @@ def train_model():
     try:
         data = np.loadtxt(HISTORY_FILE, delimiter=",", skiprows=1)
 
-        if data.shape[0] < 50:
+        if len(data.shape) < 2 or data.shape[0] < 50:
             return
 
-        X = data[:, 0:4]
-        y = data[:, 4] > 0
+        X = data[:,0:4]
+        y = data[:,4] > 0
 
         model = RandomForestClassifier(n_estimators=200)
-        model.fit(X, y)
+        model.fit(X,y)
 
         notify("ML MODEL ACTIVATED")
 
@@ -132,7 +134,7 @@ def get_symbols():
         return symbols[:MAX_SYMBOLS]
 
     except:
-        return ["BTC-USD", "ETH-USD"]
+        return ["BTC-USD","ETH-USD"]
 
 def get_ticker(sym):
     try:
@@ -156,7 +158,7 @@ def get_candles(sym):
     try:
         r = requests.get(
             BASE_URL + f"/products/{sym}/candles",
-            params={"granularity": 60},
+            params={"granularity":60},
             timeout=10
         )
 
@@ -177,12 +179,14 @@ def get_candles(sym):
 #########################################
 
 def calc_rsi(closes):
+
     if len(closes) < 15:
         return 50
 
     deltas = np.diff(closes)
-    gains = np.maximum(deltas, 0)
-    losses = -np.minimum(deltas, 0)
+
+    gains = np.maximum(deltas,0)
+    losses = -np.minimum(deltas,0)
 
     avg_gain = np.mean(gains[-14:])
     avg_loss = np.mean(losses[-14:])
@@ -191,22 +195,30 @@ def calc_rsi(closes):
         return 100
 
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+
+    return 100 - (100/(1+rs))
 
 def trend_strength(closes):
+
     avg = np.mean(closes)
+
     if avg == 0:
         return 0
+
     return (closes[-1] - avg) / avg
 
 def momentum(closes):
+
     if len(closes) < 6:
         return 0
+
     return (closes[-1] - closes[-5]) / closes[-5]
 
 def volume_ratio(vols):
+
     if len(vols) < 20:
         return 1
+
     return vols[-1] / np.mean(vols[-20:])
 
 #########################################
@@ -217,26 +229,34 @@ cash = START_BALANCE
 open_trades = []
 
 #########################################
-# POSITION SIZE
+# POSITION SIZE WITH $25 MINIMUM + SCALING
 #########################################
 
 def position_size():
-    percent = MIN_POSITION_SIZE_PERCENT
 
-    if learning["trade_count"] > 50:
+    if learning["trade_count"] < 50:
+        percent = MIN_POSITION_SIZE_PERCENT
+    else:
         percent = MAX_POSITION_SIZE_PERCENT
 
-    size = cash * percent / 100
+    percent_size = cash * percent / 100
 
-    return min(size, cash)
+    size = max(percent_size, MIN_POSITION_USD)
+
+    size = min(size, cash)
+
+    return size
 
 #########################################
-# RECORD TRADE
+# RECORD TRADE FOR ML
 #########################################
 
 def record_trade(t, profit):
+
     with open(HISTORY_FILE, "a", newline="") as f:
+
         writer = csv.writer(f)
+
         writer.writerow([
             t["rsi"],
             t["volume_ratio"],
@@ -267,13 +287,14 @@ def close_trade(t, price, reason):
         learning["loss_count"] += 1
 
     save_learning()
+
     record_trade(t, profit)
 
     winrate = learning["win_count"] / max(1, learning["trade_count"]) * 100
 
     notify(
 f"""SELL {t['sym']} ({reason})
-Profit: {profit:.4f}
+Profit: {profit:.2f}
 Balance: {cash:.2f}
 
 Trades: {learning['trade_count']}
@@ -302,6 +323,7 @@ def open_trade(sym, price, features):
         return
 
     qty = size / price
+
     cash -= size
 
     trade = {
@@ -310,14 +332,14 @@ def open_trade(sym, price, features):
         "qty": qty,
         "time": time.time(),
         "peak": price,
-        "stop": price * (1 - STOP_LOSS_PERCENT / 100),
+        "stop": price * (1 - STOP_LOSS_PERCENT/100),
         "trail": None,
         **features
     }
 
     open_trades.append(trade)
 
-    notify(f"BUY {sym} | Balance {cash:.2f}")
+    notify(f"BUY {sym} | Size ${size:.2f} | Cash ${cash:.2f}")
 
 #########################################
 # MANAGE TRADES
@@ -342,8 +364,8 @@ def manage_trades():
         if price > t["peak"]:
             t["peak"] = price
 
-        if price >= t["entry"] * (1 + TRAILING_START_PERCENT / 100):
-            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT / 100)
+        if price >= t["entry"] * (1 + TRAILING_START_PERCENT/100):
+            t["trail"] = t["peak"] * (1 - TRAILING_DISTANCE_PERCENT/100)
 
         age_min = (time.time() - t["time"]) / 60
         profit_pct = (price - t["entry"]) / t["entry"] * 100
@@ -382,6 +404,7 @@ while True:
         prices = {}
 
         for sym in symbols:
+
             price = get_ticker(sym)
 
             if price is not None:
