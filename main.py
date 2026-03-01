@@ -1,5 +1,5 @@
-# main.py
-# Coin Sniper — Savage Mode (Stable, Persistent, No Loop Version)
+# Coin Sniper — Savage Mode ELITE
+# ML Enabled + GitHub Persistence + Auto File Creation
 
 import os
 import time
@@ -25,9 +25,10 @@ STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
 TRAIL_START = float(os.getenv("TRAILING_START_PERCENT", 1.2))
 TRAIL_DIST = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
 
-COOLDOWN_SECONDS = 180  # prevents instant rebuy
+COOLDOWN_SECONDS = 180
 
-ML_ENABLE_AFTER = 50
+ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
+ML_ENABLE_AFTER = int(os.getenv("ML_ENABLE_AFTER", 25))
 
 BASE_URL = "https://api.exchange.coinbase.com/products"
 
@@ -45,122 +46,244 @@ LEARNING_FILE = "learning.json"
 POSITIONS_FILE = "positions.json"
 HISTORY_FILE = "trade_history.csv"
 COOLDOWN_FILE = "cooldown.json"
+MODEL_FILE = "ml_model.json"
 
 # =========================
 # TELEGRAM
 # =========================
 
 def notify(msg):
+
     print(msg)
+
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+
         try:
+
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
                 timeout=10,
             )
+
         except:
             pass
 
+
 # =========================
-# SAFE LOAD/SAVE
+# AUTO FILE CREATION
 # =========================
 
-def load_json(file, default):
-    if os.path.exists(file):
-        try:
-            with open(file, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return default
+def ensure_files():
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
+    if not os.path.exists(LEARNING_FILE):
+
+        with open(LEARNING_FILE,"w") as f:
+
+            json.dump({
+                "cash": START_BALANCE,
+                "start_balance": START_BALANCE,
+                "trade_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "total_profit": 0
+            }, f)
+
+    if not os.path.exists(POSITIONS_FILE):
+
+        with open(POSITIONS_FILE,"w") as f:
+            json.dump({}, f)
+
+    if not os.path.exists(COOLDOWN_FILE):
+
+        with open(COOLDOWN_FILE,"w") as f:
+            json.dump({}, f)
+
+    if not os.path.exists(HISTORY_FILE):
+
+        with open(HISTORY_FILE,"w") as f:
+            f.write("profit\n")
+
+
+ensure_files()
+
+
+# =========================
+# LOAD / SAVE
+# =========================
+
+def load_json(file):
+
+    with open(file,"r") as f:
+        return json.load(f)
+
+def save_json(file,data):
+
+    with open(file,"w") as f:
+        json.dump(data,f)
+
+
+# =========================
+# GITHUB AUTO SAVE
+# =========================
+
+def github_upload(filename):
+
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return
+
+    try:
+
+        with open(filename,"r") as f:
+            content = f.read()
+
+        import base64
+
+        encoded = base64.b64encode(content.encode()).decode()
+
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}"
+        }
+
+        r = requests.get(url, headers=headers)
+
+        sha = None
+
+        if r.status_code == 200:
+
+            sha = r.json()["sha"]
+
+        data = {
+            "message": f"Auto update {filename}",
+            "content": encoded,
+            "branch": "main"
+        }
+
+        if sha:
+            data["sha"] = sha
+
+        requests.put(url, headers=headers, json=data)
+
+    except:
+        pass
+
+
+def github_backup_all():
+
+    github_upload(LEARNING_FILE)
+    github_upload(POSITIONS_FILE)
+    github_upload(COOLDOWN_FILE)
+    github_upload(HISTORY_FILE)
+
 
 # =========================
 # STATE
 # =========================
 
-learning = load_json(LEARNING_FILE, {
-    "cash": START_BALANCE,
-    "start_balance": START_BALANCE,
-    "trade_count": 0,
-    "win_count": 0,
-    "loss_count": 0,
-    "total_profit": 0
-})
-
-positions = load_json(POSITIONS_FILE, {})
-cooldown = load_json(COOLDOWN_FILE, {})
+learning = load_json(LEARNING_FILE)
+positions = load_json(POSITIONS_FILE)
+cooldown = load_json(COOLDOWN_FILE)
 
 cash = learning["cash"]
 
-# =========================
-# HISTORY FILE
-# =========================
-
-if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "w") as f:
-        f.write("profit\n")
 
 # =========================
-# MARKET DATA SAFE
+# MARKET DATA
 # =========================
 
 def get_price(symbol):
+
     try:
+
         r = requests.get(f"{BASE_URL}/{symbol}/ticker", timeout=10)
+
         data = r.json()
+
         if "price" not in data:
             return None
+
         return float(data["price"])
+
     except:
+
         return None
 
+
 def get_symbols():
+
     try:
+
         r = requests.get(BASE_URL, timeout=10)
+
         data = r.json()
+
         return [
-            p["id"] for p in data
+            p["id"]
+            for p in data
             if p["quote_currency"] == "USD"
         ][:60]
+
     except:
+
         return []
+
 
 symbols = get_symbols()
 
+
 # =========================
-# ML MODEL
+# ML SYSTEM
 # =========================
 
 model = None
 
 def train_model():
+
     global model
+
+    if not ML_ENABLED:
+        return
+
     try:
+
         data = np.genfromtxt(HISTORY_FILE, delimiter=",", skip_header=1)
+
         if len(data) < ML_ENABLE_AFTER:
             return
+
         X = np.arange(len(data)).reshape(-1,1)
+
         y = (data > 0).astype(int)
-        model = RandomForestClassifier()
+
+        model = RandomForestClassifier(n_estimators=100)
+
         model.fit(X,y)
+
+        notify("ML MODEL TRAINED")
+
     except:
+
         pass
+
 
 # =========================
 # EQUITY
 # =========================
 
 def equity(prices):
+
     total = cash
+
     for sym,pos in positions.items():
+
         if sym in prices:
+
             total += pos["qty"] * prices[sym]
+
     return total
+
 
 # =========================
 # OPEN TRADE
@@ -189,6 +312,7 @@ def open_trade(sym, price):
     qty = size / price
 
     positions[sym] = {
+
         "entry": price,
         "qty": qty,
         "peak": price,
@@ -199,12 +323,8 @@ def open_trade(sym, price):
 
     learning["cash"] = cash
 
-    notify(
-        f"BUY {sym}\n"
-        f"Price: {price:.6f}\n"
-        f"Size: ${size:.2f}\n"
-        f"Cash: ${cash:.2f}"
-    )
+    notify(f"BUY {sym} @ {price}")
+
 
 # =========================
 # SELL TRADE
@@ -225,6 +345,7 @@ def sell_trade(sym, price):
     cash += proceeds
 
     learning["cash"] = cash
+
     learning["trade_count"] += 1
 
     if profit > 0:
@@ -235,41 +356,42 @@ def sell_trade(sym, price):
     learning["total_profit"] += profit
 
     with open(HISTORY_FILE,"a") as f:
+
         f.write(f"{profit}\n")
 
     cooldown[sym] = time.time()
 
     del positions[sym]
 
-    notify(
-        f"SELL {sym}\n"
-        f"Profit: {profit:.2f}\n"
-        f"Cash: ${cash:.2f}"
-    )
+    notify(f"SELL {sym} Profit: {profit:.2f}")
+
 
 # =========================
 # SAVE
 # =========================
 
 def save_all():
+
     save_json(LEARNING_FILE, learning)
     save_json(POSITIONS_FILE, positions)
     save_json(COOLDOWN_FILE, cooldown)
+
+    github_backup_all()
+
 
 # =========================
 # START
 # =========================
 
-notify(
-    f"BOT STARTED (SAVAGE MODE)\n"
-    f"Cash: ${cash:.2f}\n"
-    f"Open Trades: {len(positions)}"
-)
+notify(f"BOT STARTED — ELITE MODE\nCash: ${cash:.2f}")
 
 last_status = time.time()
 
+train_model()
+
+
 # =========================
-# LOOP
+# MAIN LOOP
 # =========================
 
 while True:
@@ -283,9 +405,12 @@ while True:
             price = get_price(sym)
 
             if price:
+
                 prices[sym] = price
 
-        # Manage sells
+
+        # SELL LOGIC
+
         for sym in list(positions):
 
             price = prices.get(sym)
@@ -301,47 +426,45 @@ while True:
             trail = pos["peak"]*(1-TRAIL_DIST/100)
 
             if price <= pos["stop"] or price <= trail:
+
                 sell_trade(sym, price)
 
-        # Open new trades
+
+        # BUY LOGIC
+
         for sym in symbols:
 
             if sym in prices:
+
                 open_trade(sym, prices[sym])
 
-        # Status
+
+        # STATUS
+
         if time.time() - last_status > STATUS_INTERVAL:
 
             eq = equity(prices)
 
-            trades = learning["trade_count"]
-            wins = learning["win_count"]
-            losses = learning["loss_count"]
-
-            winrate = (wins/trades*100) if trades>0 else 0
-
             notify(
                 f"STATUS\n"
-                f"Cash: ${cash:.2f}\n"
-                f"Equity: ${eq:.2f}\n"
-                f"Profit: ${learning['total_profit']:.2f}\n"
-                f"Open Trades: {len(positions)}\n"
-                f"Trades: {trades}\n"
-                f"Wins: {wins}\n"
-                f"Losses: {losses}\n"
-                f"Winrate: {winrate:.1f}%"
+                f"Cash: {cash:.2f}\n"
+                f"Equity: {eq:.2f}\n"
+                f"Trades: {learning['trade_count']}\n"
+                f"Profit: {learning['total_profit']:.2f}"
             )
 
             last_status = time.time()
 
+
         save_all()
+
+        train_model()
 
         time.sleep(SCAN_INTERVAL)
 
+
     except Exception as e:
 
-        notify(
-            f"ERROR\n{str(e)}\n{traceback.format_exc()}"
-        )
+        notify(f"ERROR\n{traceback.format_exc()}")
 
         time.sleep(10)
