@@ -1,37 +1,11 @@
-# ============================================================
-# COIN SNIPER BOT — STABLE BUILD (NO LOOP VERSION)
-# JD SAFE EDITION
-# ============================================================
-
 import os
 import time
 import json
 import csv
-import requests
 import traceback
+import requests
 import numpy as np
-from typing import Dict, List, Optional
 from sklearn.ensemble import RandomForestClassifier
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 300))
-
-START_BALANCE = float(os.getenv("START_BALANCE", 1000))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
-
-MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 25))
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
-TRAIL_START = float(os.getenv("TRAIL_START", 1.2))
-TRAIL_DISTANCE = float(os.getenv("TRAIL_DISTANCE", 0.9))
-
-ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", 50))
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://api.exchange.coinbase.com"
 
@@ -39,267 +13,251 @@ LEARNING_FILE = "learning.json"
 POSITIONS_FILE = "positions.json"
 HISTORY_FILE = "trade_history.csv"
 
-COOLDOWN_SECONDS = 1800
+START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+STOP_LOSS = float(os.getenv("STOP_LOSS_PERCENT", "2.8")) / 100
+TRAIL_START = float(os.getenv("TRAILING_START_PERCENT", "1.2")) / 100
+TRAIL_DIST = float(os.getenv("TRAILING_DISTANCE_PERCENT", "0.9")) / 100
+
+MIN_TRADE = float(os.getenv("MIN_TRADE_SIZE_USD", "25"))
+MAX_OPEN = int(os.getenv("MAX_OPEN_TRADES", "20"))
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+
+session = requests.Session()
+
 
 def notify(msg):
 
     print(msg, flush=True)
 
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT:
         try:
-            requests.post(
+            session.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+                json={"chat_id": TELEGRAM_CHAT, "text": msg},
                 timeout=10
             )
         except:
             pass
 
 
-# ============================================================
-# FILE CREATION
-# ============================================================
+def load_json(file, default):
 
-def ensure_learning():
+    if not os.path.exists(file):
+        return default
 
-    if not os.path.exists(LEARNING_FILE):
-
-        data = {
-            "cash": START_BALANCE,
-            "start_balance": START_BALANCE,
-            "trade_count": 0,
-            "win_count": 0,
-            "loss_count": 0,
-            "total_profit": 0.0
-        }
-
-        with open(LEARNING_FILE, "w") as f:
-            json.dump(data, f)
-
-        return data
-
-    with open(LEARNING_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(file) as f:
+            return json.load(f)
+    except:
+        return default
 
 
-def save_learning(data):
+def save_json(file, data):
 
-    with open(LEARNING_FILE, "w") as f:
+    with open(file, "w") as f:
         json.dump(data, f)
 
 
-def ensure_positions():
+learning = load_json(LEARNING_FILE, {
+    "cash": START_BALANCE,
+    "trade_count": 0,
+    "win_count": 0,
+    "loss_count": 0,
+    "total_profit": 0
+})
 
-    if not os.path.exists(POSITIONS_FILE):
+positions = load_json(POSITIONS_FILE, {})
 
-        with open(POSITIONS_FILE, "w") as f:
-            json.dump({}, f)
-
-        return {}
-
-    with open(POSITIONS_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_positions(data):
-
-    with open(POSITIONS_FILE, "w") as f:
-        json.dump(data, f)
+cash = learning["cash"]
 
 
-def ensure_history():
+def save_state():
 
-    if not os.path.exists(HISTORY_FILE):
+    learning["cash"] = cash
 
-        with open(HISTORY_FILE, "w", newline="") as f:
+    save_json(LEARNING_FILE, learning)
+    save_json(POSITIONS_FILE, positions)
 
-            writer = csv.writer(f)
-            writer.writerow(["profit"])
-
-
-def append_history(profit):
-
-    with open(HISTORY_FILE, "a", newline="") as f:
-
-        writer = csv.writer(f)
-        writer.writerow([profit])
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
 
 def get_symbols():
 
-    r = requests.get(BASE_URL + "/products")
+    try:
 
-    return [x["id"] for x in r.json() if x["quote_currency"] == "USD"][:60]
+        r = session.get(BASE_URL + "/products", timeout=10)
+
+        if r.status_code != 200:
+            return []
+
+        data = r.json()
+
+        return [
+            x["id"] for x in data
+            if x["quote_currency"] == "USD"
+        ][:60]
+
+    except:
+        return []
 
 
 def get_price(symbol):
 
-    r = requests.get(BASE_URL + f"/products/{symbol}/ticker")
+    try:
 
-    return float(r.json()["price"])
+        r = session.get(
+            BASE_URL + f"/products/{symbol}/ticker",
+            timeout=10
+        )
 
+        if r.status_code != 200:
+            return None
 
-# ============================================================
-# LEARNING STATE
-# ============================================================
+        data = r.json()
 
-learning = ensure_learning()
+        if "price" not in data:
+            return None
 
-cash = learning["cash"]
+        return float(data["price"])
 
-positions = ensure_positions()
-
-ensure_history()
-
-last_exit = {}
-
-model = None
-
-
-# ============================================================
-# ML TRAIN
-# ============================================================
-
-def train_model():
-
-    global model
-
-    if learning["trade_count"] < ML_MIN_TRADES:
-
-        model = None
-        return
-
-    data = np.genfromtxt(HISTORY_FILE, delimiter=",", skip_header=1)
-
-    X = np.arange(len(data)).reshape(-1,1)
-
-    y = (data > 0).astype(int)
-
-    model = RandomForestClassifier()
-
-    model.fit(X,y)
-
-    notify("ML ACTIVATED")
+    except:
+        return None
 
 
-# ============================================================
-# EQUITY
-# ============================================================
-
-def equity(prices):
+def compute_equity(prices):
 
     total = cash
 
     for sym in positions:
 
-        total += positions[sym]["qty"] * prices.get(sym,0)
+        if sym in prices:
+            total += positions[sym]["qty"] * prices[sym]
 
     return total
 
 
-# ============================================================
-# BUY
-# ============================================================
-
-def buy(sym, price):
+def open_trade(sym, price):
 
     global cash
 
-    if sym in last_exit:
-
-        if time.time() - last_exit[sym] < COOLDOWN_SECONDS:
-
-            return
-
-    if len(positions) >= MAX_OPEN_TRADES:
-
+    if sym in positions:
         return
 
-    if cash < MIN_TRADE_SIZE:
-
+    if len(positions) >= MAX_OPEN:
         return
 
-    size = MIN_TRADE_SIZE
+    if cash < MIN_TRADE:
+        return
 
-    qty = size / price
+    qty = MIN_TRADE / price
 
     positions[sym] = {
         "entry": price,
         "qty": qty,
-        "peak": price,
-        "stop": price*(1-STOP_LOSS_PERCENT/100),
-        "time": time.time()
+        "peak": price
     }
 
-    cash -= size
+    cash -= MIN_TRADE
 
-    learning["cash"] = cash
+    notify(
+        f"BUY {sym}\n"
+        f"Price: {price:.4f}\n"
+        f"Cash: {cash:.2f}"
+    )
 
-    save_learning(learning)
-    save_positions(positions)
-
-    notify(f"BUY {sym}\nPrice: {price:.4f}\nCash: {cash:.2f}")
+    save_state()
 
 
-# ============================================================
-# SELL
-# ============================================================
-
-def sell(sym, price):
+def close_trade(sym, price):
 
     global cash
 
     pos = positions[sym]
 
-    proceeds = pos["qty"]*price
+    proceeds = pos["qty"] * price
 
-    profit = proceeds - (pos["qty"]*pos["entry"])
+    profit = proceeds - (pos["qty"] * pos["entry"])
 
     cash += proceeds
 
-    learning["cash"] = cash
     learning["trade_count"] += 1
-    learning["total_profit"] += profit
 
-    if profit>0:
+    if profit > 0:
         learning["win_count"] += 1
     else:
         learning["loss_count"] += 1
 
-    append_history(profit)
+    learning["total_profit"] += profit
 
-    last_exit[sym] = time.time()
+    notify(
+        f"SELL {sym}\n"
+        f"Profit: {profit:.2f}\n"
+        f"Cash: {cash:.2f}"
+    )
 
     del positions[sym]
 
-    save_learning(learning)
-    save_positions(positions)
-
-    notify(f"SELL {sym}\nProfit: {profit:.2f}\nCash: {cash:.2f}")
+    save_state()
 
 
-# ============================================================
-# START
-# ============================================================
+def manage_trades(prices):
 
-notify(f"BOT STARTED\nCash: {cash:.2f}\nOpen Trades: {len(positions)}")
+    for sym in list(positions.keys()):
+
+        price = prices.get(sym)
+
+        if price is None:
+            continue
+
+        pos = positions[sym]
+
+        entry = pos["entry"]
+
+        if price > pos["peak"]:
+            pos["peak"] = price
+
+        trail = pos["peak"] * (1 - TRAIL_DIST)
+
+        stop = entry * (1 - STOP_LOSS)
+
+        if price <= stop or price <= trail:
+            close_trade(sym, price)
+
+
+def status(prices):
+
+    equity = compute_equity(prices)
+
+    trades = learning["trade_count"]
+    wins = learning["win_count"]
+    losses = learning["loss_count"]
+
+    wr = (wins / trades * 100) if trades > 0 else 0
+
+    notify(
+        f"STATUS\n"
+        f"Cash: {cash:.2f}\n"
+        f"Equity: {equity:.2f}\n"
+        f"Open Trades: {len(positions)}\n"
+        f"Trades: {trades}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Winrate: {wr:.1f}%"
+    )
+
 
 symbols = get_symbols()
 
-last_status = time.time()
+notify(
+    f"BOT STARTED\n"
+    f"Cash: {cash:.2f}\n"
+    f"Open Trades: {len(positions)}"
+)
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+last_status = 0
 
 while True:
 
@@ -309,59 +267,33 @@ while True:
 
         for sym in symbols:
 
-            prices[sym] = get_price(sym)
+            price = get_price(sym)
 
-        for sym in list(positions):
+            if price is not None:
+                prices[sym] = price
 
-            pos = positions[sym]
-
-            price = prices[sym]
-
-            if price>pos["peak"]:
-                pos["peak"]=price
-
-            if price<=pos["stop"]:
-                sell(sym,price)
-                continue
-
-            trail = pos["peak"]*(1-TRAIL_DISTANCE/100)
-
-            if price<=trail:
-                sell(sym,price)
+        manage_trades(prices)
 
         for sym in symbols:
 
-            if sym not in positions:
+            if sym not in positions and sym in prices:
+                open_trade(sym, prices[sym])
 
-                buy(sym,prices[sym])
+        if time.time() - last_status > STATUS_INTERVAL:
 
-        if time.time()-last_status>STATUS_INTERVAL:
+            status(prices)
 
-            eq = equity(prices)
-
-            wins=learning["win_count"]
-            losses=learning["loss_count"]
-            trades=learning["trade_count"]
-
-            winrate=(wins/trades*100) if trades>0 else 0
-
-            notify(
-                f"STATUS\n"
-                f"Cash: {cash:.2f}\n"
-                f"Equity: {eq:.2f}\n"
-                f"Open Trades: {len(positions)}\n"
-                f"Trades: {trades}\n"
-                f"Wins: {wins}\n"
-                f"Losses: {losses}\n"
-                f"Winrate: {winrate:.2f}%"
-            )
-
-            last_status=time.time()
+            last_status = time.time()
 
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
 
-        notify(f"ERROR\n{str(e)}\n{traceback.format_exc()}")
+        notify(
+            "ERROR\n"
+            + str(e)
+            + "\n"
+            + traceback.format_exc()
+        )
 
         time.sleep(10)
