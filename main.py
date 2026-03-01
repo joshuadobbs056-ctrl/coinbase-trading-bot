@@ -1,4 +1,4 @@
-# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED)
+# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED + SCAN LOGS)
 
 import os
 import time
@@ -40,7 +40,6 @@ SCAN_INTERVAL=int(os.getenv("SCAN_INTERVAL",15))
 STATUS_INTERVAL=int(os.getenv("STATUS_INTERVAL",60))
 SAVE_INTERVAL=int(os.getenv("SAVE_INTERVAL",60))
 ML_INTERVAL=int(os.getenv("ML_INTERVAL",300))
-GITHUB_INTERVAL=int(os.getenv("GITHUB_INTERVAL",300))
 
 MAX_OPEN_TRADES=int(os.getenv("MAX_OPEN_TRADES",20))
 MIN_TRADE_SIZE=float(os.getenv("MIN_TRADE_SIZE",25))
@@ -63,10 +62,6 @@ BASE_URL="https://api.exchange.coinbase.com/products"
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
-GITHUB_TOKEN=os.getenv("GITHUB_TOKEN")
-GITHUB_REPO=os.getenv("GITHUB_DATA_REPO")
-GITHUB_BRANCH=os.getenv("GITHUB_BRANCH","main")
-
 LEARNING_FILE="learning.json"
 POSITIONS_FILE="positions.json"
 COOLDOWN_FILE="cooldown.json"
@@ -77,7 +72,7 @@ ml_model=None
 ml_active=False
 
 def notify(msg:str):
-    print(msg)
+    print(msg, flush=True)
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.post(
@@ -155,11 +150,8 @@ def get_price(sym):
 def get_symbols():
     try:
         r=requests.get(BASE_URL,timeout=10)
-        return [
-            p["id"]
-            for p in r.json()
-            if p.get("quote_currency")=="USD"
-        ][:60]
+        syms=[p["id"] for p in r.json() if p.get("quote_currency")=="USD"]
+        return syms[:60]
     except:
         return []
 
@@ -209,35 +201,21 @@ def extract_features(sym,price,score):
 
 def train_model():
     global ml_model,ml_active
-
-    if not ML_ENABLED:
-        return
-
+    if not ML_ENABLED:return
     try:
         data=np.genfromtxt(ML_TRAIN_FILE,delimiter=",",skip_header=1)
-        if len(data)<ML_ENABLE_AFTER:
-            if not ml_active:
-                notify(f"ML LEARNING ({len(data)}/{ML_ENABLE_AFTER})")
+        if data is None or len(data)<ML_ENABLE_AFTER:
+            notify(f"ML LEARNING ({0 if data is None else len(data)}/{ML_ENABLE_AFTER})")
             return
-
         X=data[:,:-1]
         y=data[:,-1]
-
         model=RandomForestClassifier(n_estimators=300)
         model.fit(X,y)
-
         ml_model=model
-
         if not ml_active:
             ml_active=True
-            notify(f"""
-ML ACTIVATED
-Samples: {len(data)}
-Bot now using probability-based trading
-""")
-
-        notify(f"ML TRAINED | samples={len(data)}")
-
+            notify(f"ML ACTIVATED — LIVE TRADING MODE")
+        notify(f"ML TRAINED samples={len(data)}")
     except:
         pass
 
@@ -255,9 +233,7 @@ def winrate():
     return w/t*100 if t>0 else 0
 
 def open_trade(sym,price,score):
-
     global cash
-
     if sym in positions:return
     if cash<MIN_TRADE_SIZE:return
 
@@ -269,7 +245,6 @@ def open_trade(sym,price,score):
         if prob<ML_MIN_PROB:return
 
     size=min(MIN_TRADE_SIZE,cash)
-
     qty=size/price
 
     positions[sym]={
@@ -286,34 +261,25 @@ def open_trade(sym,price,score):
     notify(f"BUY {sym} score={score} cash={cash}")
 
 def sell_trade(sym,price,reason):
-
     global cash
-
     pos=positions[sym]
     entry=pos["entry"]
     qty=pos["qty"]
-
     profit=(price-entry)*qty
-
     cash+=qty*price
 
     learning["cash"]=cash
     learning["trade_count"]+=1
 
-    if profit>0:
-        learning["win_count"]+=1
-    else:
-        learning["loss_count"]+=1
+    if profit>0: learning["win_count"]+=1
+    else: learning["loss_count"]+=1
 
     learning["total_profit"]+=profit
 
     open(HISTORY_FILE,"a").write(f"{profit}\n")
 
     outcome=1 if profit>0 else 0
-
-    open(ML_TRAIN_FILE,"a").write(
-        ",".join(map(str,pos["features"]))+f",{outcome}\n"
-    )
+    open(ML_TRAIN_FILE,"a").write(",".join(map(str,pos["features"]))+f",{outcome}\n")
 
     del positions[sym]
 
@@ -327,12 +293,12 @@ last_status=0
 last_ml=0
 
 while True:
-
     try:
-
         now=time.time()
 
         if now-last_scan>=SCAN_INTERVAL:
+
+            notify(f"SCANNING {len(symbols)} symbols | history coins={len(price_history)}")
 
             prices={}
 
@@ -345,17 +311,16 @@ while True:
             last_prices=prices
 
             for sym,pos in list(positions.items()):
-
                 px=prices.get(sym)
-                if not px:continue
-
-                if px<=pos["stop"]:
+                if px and px<=pos["stop"]:
                     sell_trade(sym,px,"STOP")
 
+            ready=sum(1 for s in price_history if len(price_history[s])>=40)
+
+            notify(f"HISTORY READY: {ready}/{len(symbols)} coins")
+
             for sym,px in prices.items():
-
                 score=score_coin(sym,px)
-
                 if score>=ENTRY_SCORE_MIN:
                     open_trade(sym,px,score)
 
