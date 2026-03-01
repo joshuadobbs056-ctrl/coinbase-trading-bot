@@ -1,9 +1,4 @@
-# Coin Sniper — Savage Mode ELITE (STABLE)
-# ✅ Single-instance lock
-# ✅ Persistent files
-# ✅ GitHub backup to DATA repo (NOT deploy repo)
-# ✅ Correct stats: wins/losses/open/profit/equity
-# ✅ Pause support
+# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED)
 
 import os
 import time
@@ -13,256 +8,267 @@ import requests
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
-# =========================
-# SINGLE INSTANCE LOCK
-# =========================
-
 LOCK_FILE = os.getenv("LOCK_FILE", "/tmp/coin_sniper.lock")
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid:int)->bool:
     try:
-        os.kill(pid, 0)
+        os.kill(pid,0)
         return True
-    except Exception:
+    except:
         return False
 
 def acquire_lock_or_exit():
     if os.path.exists(LOCK_FILE):
         try:
-            with open(LOCK_FILE, "r") as f:
-                raw = f.read().strip()
+            raw=open(LOCK_FILE).read().strip()
             if raw:
-                old_pid = int(raw.split("|")[0])
-                if old_pid and _pid_alive(old_pid):
-                    print(f"[LOCK] Instance already running (pid={old_pid})")
+                old_pid=int(raw.split("|")[0])
+                if _pid_alive(old_pid):
                     raise SystemExit(0)
         except SystemExit:
             raise
         except:
             pass
-
-    with open(LOCK_FILE, "w") as f:
-        f.write(f"{os.getpid()}|{int(time.time())}")
+    open(LOCK_FILE,"w").write(f"{os.getpid()}|{int(time.time())}")
 
 acquire_lock_or_exit()
+INSTANCE_ID=str(os.getpid())
 
-INSTANCE_ID = str(os.getpid())
+START_BALANCE=float(os.getenv("START_BALANCE",1000))
 
-# =========================
-# CONFIG
-# =========================
+SCAN_INTERVAL=int(os.getenv("SCAN_INTERVAL",15))
+STATUS_INTERVAL=int(os.getenv("STATUS_INTERVAL",60))
+SAVE_INTERVAL=int(os.getenv("SAVE_INTERVAL",60))
+ML_INTERVAL=int(os.getenv("ML_INTERVAL",300))
+GITHUB_INTERVAL=int(os.getenv("GITHUB_INTERVAL",300))
 
-START_BALANCE = float(os.getenv("START_BALANCE", 1000))
+MAX_OPEN_TRADES=int(os.getenv("MAX_OPEN_TRADES",20))
+MIN_TRADE_SIZE=float(os.getenv("MIN_TRADE_SIZE",25))
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
+STOP_LOSS_PERCENT=float(os.getenv("STOP_LOSS_PERCENT",4.0))
+TRAIL_DIST_BASE=float(os.getenv("TRAILING_DISTANCE_PERCENT",0.9))
 
-SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", 60))
-ML_INTERVAL = int(os.getenv("ML_INTERVAL", 300))
-GITHUB_INTERVAL = int(os.getenv("GITHUB_INTERVAL", 300))
+COOLDOWN_SECONDS=int(os.getenv("COOLDOWN_SECONDS",180))
 
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
-MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 25))
+ENTRY_SCORE_MIN=int(os.getenv("ENTRY_SCORE_MIN",7))
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
-TRAIL_DIST = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
+ML_ENABLED=os.getenv("ML_ENABLED","true").lower()=="true"
+ML_ENABLE_AFTER=int(os.getenv("ML_ENABLE_AFTER",50))
+ML_MIN_PROB=float(os.getenv("ML_MIN_PROB",0.62))
 
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
+BOT_PAUSED=os.getenv("BOT_PAUSED","false").lower()=="true"
 
-ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
-ML_ENABLE_AFTER = int(os.getenv("ML_ENABLE_AFTER", 25))
+BASE_URL="https://api.exchange.coinbase.com/products"
 
-BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
 
-BASE_URL = "https://api.exchange.coinbase.com/products"
+GITHUB_TOKEN=os.getenv("GITHUB_TOKEN")
+GITHUB_REPO=os.getenv("GITHUB_DATA_REPO")
+GITHUB_BRANCH=os.getenv("GITHUB_BRANCH","main")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+LEARNING_FILE="learning.json"
+POSITIONS_FILE="positions.json"
+COOLDOWN_FILE="cooldown.json"
+HISTORY_FILE="trade_history.csv"
+ML_TRAIN_FILE="ml_training.csv"
 
-# ✅ THIS IS THE IMPORTANT FIX
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_DATA_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+ml_model=None
+ml_active=False
 
-# =========================
-# FILES
-# =========================
-
-LEARNING_FILE = "learning.json"
-POSITIONS_FILE = "positions.json"
-COOLDOWN_FILE = "cooldown.json"
-HISTORY_FILE = "trade_history.csv"
-
-# =========================
-# TELEGRAM
-# =========================
-
-def notify(msg):
+def notify(msg:str):
     print(msg)
-
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10
-            )
+                json={"chat_id":TELEGRAM_CHAT_ID,"text":msg},
+                timeout=10)
         except:
             pass
 
-# =========================
-# FILE INIT
-# =========================
-
 def ensure_files():
-
     if not os.path.exists(LEARNING_FILE):
-        with open(LEARNING_FILE,"w") as f:
-            json.dump({
-                "cash": START_BALANCE,
-                "trade_count": 0,
-                "win_count": 0,
-                "loss_count": 0,
-                "total_profit": 0
-            }, f)
+        json.dump({
+            "cash":START_BALANCE,
+            "start_balance":START_BALANCE,
+            "trade_count":0,
+            "win_count":0,
+            "loss_count":0,
+            "total_profit":0.0
+        },open(LEARNING_FILE,"w"))
 
-    if not os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE,"w") as f:
-            json.dump({}, f)
-
-    if not os.path.exists(COOLDOWN_FILE):
-        with open(COOLDOWN_FILE,"w") as f:
-            json.dump({}, f)
+    for f,d in [
+        (POSITIONS_FILE,{}),
+        (COOLDOWN_FILE,{})
+    ]:
+        if not os.path.exists(f):
+            json.dump(d,open(f,"w"))
 
     if not os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE,"w") as f:
-            f.write("profit\n")
+        open(HISTORY_FILE,"w").write("profit\n")
+
+    if not os.path.exists(ML_TRAIN_FILE):
+        open(ML_TRAIN_FILE,"w").write(
+            "score,momentum,volatility,trend,range_pos,breakout,outcome\n")
 
 ensure_files()
 
-# =========================
-# LOAD STATE
-# =========================
-
-def load_json(path, default):
+def load_json(path,default):
     try:
-        with open(path,"r") as f:
-            return json.load(f)
+        if os.path.exists(path):
+            return json.load(open(path))
     except:
-        return default
+        pass
+    return default
 
-learning = load_json(LEARNING_FILE, {})
-positions = load_json(POSITIONS_FILE, {})
-cooldown = load_json(COOLDOWN_FILE, {})
-
-cash = float(learning.get("cash", START_BALANCE))
-learning["cash"] = cash
-
-# =========================
-# GITHUB BACKUP
-# =========================
-
-def github_upload(filename):
-
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
-
+def save_json(path,data):
     try:
-
-        import base64
-
-        with open(filename,"r") as f:
-            content = f.read()
-
-        encoded = base64.b64encode(content.encode()).decode()
-
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
-
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-
-        r = requests.get(url, headers=headers)
-
-        sha = None
-        if r.status_code == 200:
-            sha = r.json()["sha"]
-
-        payload = {
-            "message": f"update {filename}",
-            "content": encoded,
-            "branch": GITHUB_BRANCH
-        }
-
-        if sha:
-            payload["sha"] = sha
-
-        requests.put(url, headers=headers, json=payload)
-
+        json.dump(data,open(path,"w"))
     except:
         pass
 
-def github_backup_all():
+learning=load_json(LEARNING_FILE,{
+    "cash":START_BALANCE,
+    "trade_count":0,
+    "win_count":0,
+    "loss_count":0,
+    "total_profit":0
+})
 
-    github_upload(LEARNING_FILE)
-    github_upload(POSITIONS_FILE)
-    github_upload(COOLDOWN_FILE)
-    github_upload(HISTORY_FILE)
+positions=load_json(POSITIONS_FILE,{})
+cooldown=load_json(COOLDOWN_FILE,{})
 
-# =========================
-# MARKET
-# =========================
+cash=float(learning.get("cash",START_BALANCE))
+
+price_history={}
+symbols=[]
 
 def get_price(sym):
-
     try:
-        r = requests.get(f"{BASE_URL}/{sym}/ticker", timeout=10)
-        return float(r.json()["price"])
+        r=requests.get(f"{BASE_URL}/{sym}/ticker",timeout=10)
+        j=r.json()
+        return float(j["price"])
     except:
         return None
 
 def get_symbols():
-
     try:
-        r = requests.get(BASE_URL)
-        data = r.json()
-        return [x["id"] for x in data if x["quote_currency"]=="USD"][:60]
+        r=requests.get(BASE_URL,timeout=10)
+        return [
+            p["id"]
+            for p in r.json()
+            if p.get("quote_currency")=="USD"
+        ][:60]
     except:
         return []
 
-symbols = get_symbols()
+symbols=get_symbols()
 
-# =========================
-# STATS
-# =========================
+def update_price_history(sym,px):
+    if sym not in price_history:
+        price_history[sym]=[]
+    price_history[sym].append(px)
+    if len(price_history[sym])>120:
+        price_history[sym].pop(0)
+
+def get_hist(sym,n):
+    h=price_history.get(sym,[])
+    if len(h)<n:
+        return None
+    return np.array(h[-n:],dtype=float)
+
+def score_coin(sym,price):
+    a20=get_hist(sym,20)
+    a40=get_hist(sym,40)
+    if a20 is None or a40 is None:
+        return 0
+    mean20=a20.mean()
+    mean40=a40.mean()
+    trend=(mean20-mean40)/mean40
+    mom=(price-mean20)/mean20
+    score=0
+    if trend>0.002:score+=1
+    if trend>0.005:score+=1
+    if trend>0.01:score+=1
+    if mom>0.002:score+=1
+    if mom>0.005:score+=1
+    if mom>0.01:score+=1
+    return score
+
+def extract_features(sym,price,score):
+    a20=get_hist(sym,20)
+    a40=get_hist(sym,40)
+    if a20 is None:return None
+    mean20=a20.mean()
+    mean40=a40.mean()
+    mom=(price-mean20)/mean20
+    vol=a20.std()/mean20
+    trend=(mean20-mean40)/mean40
+    return [score,mom,vol,trend,0,0]
+
+def train_model():
+    global ml_model,ml_active
+
+    if not ML_ENABLED:
+        return
+
+    try:
+        data=np.genfromtxt(ML_TRAIN_FILE,delimiter=",",skip_header=1)
+        if len(data)<ML_ENABLE_AFTER:
+            if not ml_active:
+                notify(f"ML LEARNING ({len(data)}/{ML_ENABLE_AFTER})")
+            return
+
+        X=data[:,:-1]
+        y=data[:,-1]
+
+        model=RandomForestClassifier(n_estimators=300)
+        model.fit(X,y)
+
+        ml_model=model
+
+        if not ml_active:
+            ml_active=True
+            notify(f"""
+ML ACTIVATED
+Samples: {len(data)}
+Bot now using probability-based trading
+""")
+
+        notify(f"ML TRAINED | samples={len(data)}")
+
+    except:
+        pass
 
 def equity(prices):
-
-    total = cash
-
+    total=cash
     for sym,pos in positions.items():
-
-        if sym in prices:
-            total += pos["qty"] * prices[sym]
-
+        px=prices.get(sym)
+        if px:
+            total+=pos["qty"]*px
     return total
 
-# =========================
-# TRADE
-# =========================
+def winrate():
+    t=learning["trade_count"]
+    w=learning["win_count"]
+    return w/t*100 if t>0 else 0
 
-def open_trade(sym,price):
+def open_trade(sym,price,score):
 
     global cash
 
-    if sym in positions:
-        return
+    if sym in positions:return
+    if cash<MIN_TRADE_SIZE:return
 
-    if len(positions)>=MAX_OPEN_TRADES:
-        return
+    features=extract_features(sym,price,score)
+    if not features:return
 
-    size = min(MIN_TRADE_SIZE,cash)
+    if ml_model:
+        prob=ml_model.predict_proba([features])[0][1]
+        if prob<ML_MIN_PROB:return
 
-    if size<MIN_TRADE_SIZE:
-        return
+    size=min(MIN_TRADE_SIZE,cash)
 
     qty=size/price
 
@@ -270,26 +276,26 @@ def open_trade(sym,price):
         "entry":price,
         "qty":qty,
         "peak":price,
-        "stop":price*(1-STOP_LOSS_PERCENT/100)
+        "stop":price*(1-STOP_LOSS_PERCENT/100),
+        "features":features
     }
 
     cash-=size
     learning["cash"]=cash
 
-    notify(f"BUY {sym} ${price:.4f}")
+    notify(f"BUY {sym} score={score} cash={cash}")
 
-def sell_trade(sym,price):
+def sell_trade(sym,price,reason):
 
     global cash
 
     pos=positions[sym]
+    entry=pos["entry"]
+    qty=pos["qty"]
 
-    proceeds=pos["qty"]*price
-    cost=pos["qty"]*pos["entry"]
+    profit=(price-entry)*qty
 
-    profit=proceeds-cost
-
-    cash+=proceeds
+    cash+=qty*price
 
     learning["cash"]=cash
     learning["trade_count"]+=1
@@ -301,46 +307,24 @@ def sell_trade(sym,price):
 
     learning["total_profit"]+=profit
 
-    with open(HISTORY_FILE,"a") as f:
-        f.write(f"{profit}\n")
+    open(HISTORY_FILE,"a").write(f"{profit}\n")
 
-    cooldown[sym]=time.time()
+    outcome=1 if profit>0 else 0
+
+    open(ML_TRAIN_FILE,"a").write(
+        ",".join(map(str,pos["features"]))+f",{outcome}\n"
+    )
 
     del positions[sym]
 
-    notify(f"SELL {sym} profit ${profit:.2f}")
+    notify(f"SELL {sym} profit={profit}")
 
-# =========================
-# SAVE
-# =========================
+notify(f"BOT STARTED cash={cash}")
 
-def save_all():
-
-    with open(LEARNING_FILE,"w") as f:
-        json.dump(learning,f)
-
-    with open(POSITIONS_FILE,"w") as f:
-        json.dump(positions,f)
-
-    with open(COOLDOWN_FILE,"w") as f:
-        json.dump(cooldown,f)
-
-# =========================
-# START
-# =========================
-
-notify(f"BOT STARTED | Repo: {GITHUB_REPO}")
-
-# =========================
-# LOOP
-# =========================
-
+last_prices={}
 last_scan=0
 last_status=0
-last_save=0
-last_github=0
-
-prices={}
+last_ml=0
 
 while True:
 
@@ -350,64 +334,65 @@ while True:
 
         if now-last_scan>=SCAN_INTERVAL:
 
+            prices={}
+
             for sym in symbols:
+                px=get_price(sym)
+                if px:
+                    prices[sym]=px
+                    update_price_history(sym,px)
 
-                p=get_price(sym)
+            last_prices=prices
 
-                if p:
-                    prices[sym]=p
+            for sym,pos in list(positions.items()):
 
-            for sym in list(positions):
+                px=prices.get(sym)
+                if not px:continue
 
-                price=prices.get(sym)
+                if px<=pos["stop"]:
+                    sell_trade(sym,px,"STOP")
 
-                if not price:
-                    continue
+            for sym,px in prices.items():
 
-                pos=positions[sym]
+                score=score_coin(sym,px)
 
-                if price>pos["peak"]:
-                    pos["peak"]=price
-
-                trail=pos["peak"]*(1-TRAIL_DIST/100)
-
-                if price<=pos["stop"] or price<=trail:
-                    sell_trade(sym,price)
-
-            if not BOT_PAUSED:
-                for sym in symbols:
-                    if sym in prices:
-                        open_trade(sym,prices[sym])
+                if score>=ENTRY_SCORE_MIN:
+                    open_trade(sym,px,score)
 
             last_scan=now
 
         if now-last_status>=STATUS_INTERVAL:
 
-            eq=equity(prices)
+            eq=equity(last_prices)
 
-            notify(
-                f"STATUS | Cash ${cash:.2f} | Equity ${eq:.2f} | "
-                f"Profit ${learning['total_profit']:.2f} | "
-                f"Wins {learning['win_count']} | "
-                f"Losses {learning['loss_count']} | "
-                f"Open {len(positions)}"
-            )
+            notify(f"""
+STATUS
+Cash: {cash}
+Equity: {eq}
+Profit: {learning["total_profit"]}
+
+Open: {len(positions)}
+
+Trades: {learning["trade_count"]}
+Wins: {learning["win_count"]}
+Losses: {learning["loss_count"]}
+Winrate: {winrate():.1f}%
+
+ML: {"ACTIVE" if ml_active else "LEARNING"}
+""")
 
             last_status=now
 
-        if now-last_save>=SAVE_INTERVAL:
+        if now-last_ml>=ML_INTERVAL:
+            train_model()
+            last_ml=now
 
-            save_all()
-            last_save=now
-
-        if now-last_github>=GITHUB_INTERVAL:
-
-            github_backup_all()
-            last_github=now
+        save_json(LEARNING_FILE,learning)
+        save_json(POSITIONS_FILE,positions)
+        save_json(COOLDOWN_FILE,cooldown)
 
         time.sleep(1)
 
-    except Exception as e:
-
+    except:
         notify(traceback.format_exc())
         time.sleep(5)
