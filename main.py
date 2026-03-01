@@ -1,4 +1,4 @@
-# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED + SCAN LOGS + HISTORY GATE)
+# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED + SCAN LOGS + HISTORY GATE + DYNAMIC SIZING)
 
 import os
 import time
@@ -34,6 +34,10 @@ def acquire_lock_or_exit():
 acquire_lock_or_exit()
 INSTANCE_ID = str(os.getpid())
 
+# =========================
+# CONFIG
+# =========================
+
 START_BALANCE = float(os.getenv("START_BALANCE", 1000))
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
@@ -51,13 +55,23 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
 
 ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", 7))
 
+# Allow control from Railway
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
+EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
+
+# Bigger buys (Railway-controlled)
+CASH_RESERVE_PERCENT = float(os.getenv("CASH_RESERVE_PERCENT", 5))          # keep this % cash unspent
+MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 3)) # smallest buy % (of usable cash)
+MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 8)) # largest buy % (of usable cash)
+
 # History requirements (so we don't trade until we have enough data)
-HISTORY_POINTS_REQUIRED = int(os.getenv("HISTORY_POINTS_REQUIRED", 40))   # score needs 40 points
+HISTORY_POINTS_REQUIRED = int(os.getenv("HISTORY_POINTS_REQUIRED", 40))   # score needs 40 points (uses 20 & 40)
 MIN_HISTORY_COINS = int(os.getenv("MIN_HISTORY_COINS", 50))              # must have >= this many coins "ready"
 
 # Scan log throttle (prevents Telegram spam)
 SCAN_LOG_INTERVAL = int(os.getenv("SCAN_LOG_INTERVAL", 60))              # seconds between SCANNING/HISTORY messages
 
+# ML
 ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
 ML_ENABLE_AFTER = int(os.getenv("ML_ENABLE_AFTER", 50))
 ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", 0.62))
@@ -68,6 +82,10 @@ BASE_URL = "https://api.exchange.coinbase.com/products"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# =========================
+# FILES
+# =========================
 
 LEARNING_FILE = "learning.json"
 POSITIONS_FILE = "positions.json"
@@ -144,9 +162,14 @@ positions = load_json(POSITIONS_FILE, {})
 cooldown = load_json(COOLDOWN_FILE, {})
 
 cash = float(learning.get("cash", START_BALANCE))
+learning["cash"] = cash
 
 price_history = {}
 symbols = []
+
+# =========================
+# MARKET
+# =========================
 
 def get_price(sym):
     try:
@@ -160,7 +183,15 @@ def get_symbols():
     try:
         r = requests.get(BASE_URL, timeout=10)
         syms = [p["id"] for p in r.json() if p.get("quote_currency") == "USD"]
-        return syms[:60]
+
+        if EXCLUDE:
+            syms = [s for s in syms if s not in EXCLUDE]
+
+        # remove obvious stables even if EXCLUDE not set
+        stables = {"USDC-USD", "USDT-USD", "DAI-USD", "TUSD-USD", "USD1-USD"}
+        syms = [s for s in syms if s not in stables]
+
+        return syms[:max(1, MAX_SYMBOLS)]
     except Exception:
         return []
 
@@ -179,6 +210,10 @@ def get_hist(sym, n):
         return None
     return np.array(h[-n:], dtype=float)
 
+# =========================
+# SCORING / FEATURES
+# =========================
+
 def score_coin(sym, price):
     a20 = get_hist(sym, 20)
     a40 = get_hist(sym, 40)
@@ -195,7 +230,7 @@ def score_coin(sym, price):
     if mom > 0.002:   score += 1
     if mom > 0.005:   score += 1
     if mom > 0.01:    score += 1
-    return score
+    return int(score)
 
 def extract_features(sym, price, score):
     a20 = get_hist(sym, 20)
@@ -210,6 +245,10 @@ def extract_features(sym, price, score):
     # placeholders for future expansion:
     return [float(score), float(mom), float(vol), float(trend), 0.0, 0.0]
 
+# =========================
+# ML
+# =========================
+
 last_ml_learning_note = 0
 
 def train_model():
@@ -219,29 +258,28 @@ def train_model():
     try:
         data = np.genfromtxt(ML_TRAIN_FILE, delimiter=",", skip_header=1)
 
-        # handle empty file safely
+        # empty-safe
         if data is None or (hasattr(data, "size") and data.size == 0):
             now = time.time()
             if now - last_ml_learning_note >= 300:
-                notify(f"ML LEARNING (0/{ML_ENABLE_AFTER})")
+                notify(f"[{INSTANCE_ID}] ML LEARNING (0/{ML_ENABLE_AFTER})")
                 last_ml_learning_note = now
             return
 
-        # genfromtxt returns 1D for one row, 2D for many rows
+        # 1 row => 1D array
         if isinstance(data, np.ndarray) and data.ndim == 1:
             data = np.array([data], dtype=float)
 
         if len(data) < ML_ENABLE_AFTER:
             now = time.time()
             if now - last_ml_learning_note >= 300:
-                notify(f"ML LEARNING ({len(data)}/{ML_ENABLE_AFTER})")
+                notify(f"[{INSTANCE_ID}] ML LEARNING ({len(data)}/{ML_ENABLE_AFTER})")
                 last_ml_learning_note = now
             return
 
         X = data[:, :-1]
         y = data[:, -1]
 
-        # needs at least 2 classes
         if len(np.unique(y)) < 2:
             return
 
@@ -251,25 +289,67 @@ def train_model():
 
         if not ml_active:
             ml_active = True
-            notify("ML ACTIVATED — probability-gated entries now LIVE")
+            notify(f"[{INSTANCE_ID}] ML ACTIVATED — probability-gated entries now LIVE")
 
-        notify(f"ML TRAINED samples={len(data)}")
+        notify(f"[{INSTANCE_ID}] ML TRAINED samples={len(data)} min_prob={ML_MIN_PROB:.2f}")
 
     except Exception:
         pass
+
+# =========================
+# STATS
+# =========================
 
 def equity(prices):
     total = cash
     for sym, pos in positions.items():
         px = prices.get(sym)
         if px:
-            total += pos["qty"] * px
+            total += pos["qty"] * float(px)
     return float(total)
 
 def winrate():
     t = int(learning.get("trade_count", 0))
     w = int(learning.get("win_count", 0))
     return (w / t * 100.0) if t > 0 else 0.0
+
+# =========================
+# TRADING
+# =========================
+
+def calc_position_size_usd(score: int) -> float:
+    """
+    Uses CASH_RESERVE_PERCENT to keep cash aside.
+    Uses MIN_POSITION_SIZE_PERCENT..MAX_POSITION_SIZE_PERCENT for size, scaled by score.
+    """
+    global cash
+
+    # reserve guard
+    reserve = cash * (CASH_RESERVE_PERCENT / 100.0)
+    usable = max(0.0, cash - reserve)
+    if usable < MIN_TRADE_SIZE:
+        return 0.0
+
+    # scale position % by score strength (score 0..10)
+    # If ENTRY_SCORE_MIN is 7, score=7 -> near MIN%, score=10 -> MAX%
+    denom = max(1, (10 - ENTRY_SCORE_MIN))
+    strength = (score - ENTRY_SCORE_MIN) / denom
+    strength = max(0.0, min(1.0, strength))
+
+    pct = MIN_POSITION_SIZE_PERCENT + strength * (MAX_POSITION_SIZE_PERCENT - MIN_POSITION_SIZE_PERCENT)
+    pct = max(0.0, min(100.0, pct))
+
+    size = usable * (pct / 100.0)
+
+    # hard minimum + cap
+    if size < MIN_TRADE_SIZE:
+        size = MIN_TRADE_SIZE
+    size = min(size, usable)
+
+    # final safety
+    if size > cash:
+        size = cash
+    return float(size)
 
 def open_trade(sym, price, score):
     global cash
@@ -280,14 +360,16 @@ def open_trade(sym, price, score):
         return
     if len(positions) >= MAX_OPEN_TRADES:
         return
-    if cash < MIN_TRADE_SIZE:
+
+    size = calc_position_size_usd(score)
+    if size < MIN_TRADE_SIZE:
         return
 
     features = extract_features(sym, price, score)
     if not features:
         return
 
-    # ML gate (only if model is trained)
+    # ML gate only when model trained
     if ml_model is not None:
         try:
             prob = float(ml_model.predict_proba([features])[0][1])
@@ -296,21 +378,21 @@ def open_trade(sym, price, score):
         except Exception:
             return
 
-    size = min(MIN_TRADE_SIZE, cash)
-    qty = size / price
+    qty = size / float(price)
 
     positions[sym] = {
         "entry": float(price),
         "qty": float(qty),
         "peak": float(price),
         "stop": float(price) * (1 - STOP_LOSS_PERCENT / 100.0),
-        "features": features
+        "features": features,
+        "score": int(score),
     }
 
     cash -= size
     learning["cash"] = cash
 
-    notify(f"BUY {sym} score={score} cash={cash:.2f} open={len(positions)}")
+    notify(f"[{INSTANCE_ID}] BUY {sym} @ {price:.6f} | score={score} | size=${size:.2f} | cash=${cash:.2f} | open={len(positions)}")
 
 def sell_trade(sym, price, reason):
     global cash
@@ -332,15 +414,27 @@ def sell_trade(sym, price, reason):
 
     open(HISTORY_FILE, "a").write(f"{profit}\n")
 
-    # write ML row
+    # ML row
     outcome = 1 if profit > 0 else 0
     open(ML_TRAIN_FILE, "a").write(",".join(map(str, pos["features"])) + f",{outcome}\n")
 
     del positions[sym]
 
-    notify(f"SELL {sym} reason={reason} profit={profit:.2f} cash={cash:.2f} open={len(positions)}")
+    notify(f"[{INSTANCE_ID}] SELL {sym} @ {price:.6f} | {reason} | profit=${profit:.2f} | cash=${cash:.2f} | open={len(positions)}")
 
-notify(f"BOT STARTED cash={cash:.2f} symbols={len(symbols)} min_history_coins={MIN_HISTORY_COINS} history_points_required={HISTORY_POINTS_REQUIRED}")
+# =========================
+# STARTUP
+# =========================
+
+notify(
+    f"[{INSTANCE_ID}] BOT STARTED\n"
+    f"Cash: ${cash:.2f}\n"
+    f"Symbols: {len(symbols)} (MAX_SYMBOLS={MAX_SYMBOLS})\n"
+    f"EntryScoreMin: {ENTRY_SCORE_MIN}\n"
+    f"History gate: need >= {MIN_HISTORY_COINS} coins with >= {HISTORY_POINTS_REQUIRED} points\n"
+    f"Sizing: reserve={CASH_RESERVE_PERCENT:.1f}% | pos% {MIN_POSITION_SIZE_PERCENT:.1f}-{MAX_POSITION_SIZE_PERCENT:.1f}\n"
+    f"Paused(buys): {BOT_PAUSED}"
+)
 
 last_prices = {}
 last_scan = 0
@@ -365,7 +459,7 @@ while True:
             if prices:
                 last_prices = prices
 
-            # stops
+            # stop-loss management
             for sym, pos in list(positions.items()):
                 px = prices.get(sym)
                 if px and float(px) <= float(pos["stop"]):
@@ -375,18 +469,18 @@ while True:
             ready = sum(1 for s in price_history if len(price_history[s]) >= HISTORY_POINTS_REQUIRED)
             history_ok = (ready >= MIN_HISTORY_COINS)
 
-            # SCAN LOGS (throttled)
+            # scan logs (throttled)
             if now - last_scanlog >= SCAN_LOG_INTERVAL:
-                notify(f"SCANNING {len(symbols)} symbols | history_coins={len(price_history)}")
-                notify(f"HISTORY READY: {ready}/{len(symbols)} coins (need >= {MIN_HISTORY_COINS})")
+                notify(f"[{INSTANCE_ID}] SCANNING {len(symbols)} symbols | history_coins={len(price_history)}")
+                notify(f"[{INSTANCE_ID}] HISTORY READY: {ready}/{len(symbols)} coins (need >= {MIN_HISTORY_COINS})")
                 last_scanlog = now
 
             # only trade once enough history exists (prevents blind / premature entries)
-            if history_ok:
+            if history_ok and not BOT_PAUSED:
                 for sym, px in prices.items():
-                    sc = score_coin(sym, px)
+                    sc = score_coin(sym, float(px))
                     if sc >= ENTRY_SCORE_MIN:
-                        open_trade(sym, px, sc)
+                        open_trade(sym, float(px), int(sc))
 
             last_scan = now
 
@@ -394,16 +488,17 @@ while True:
             eq = equity(last_prices)
 
             notify(
-                f"STATUS\n"
-                f"Cash: {cash:.2f}\n"
-                f"Equity: {eq:.2f}\n"
-                f"Profit: {float(learning.get('total_profit', 0.0)):.2f}\n\n"
+                f"[{INSTANCE_ID}] STATUS\n"
+                f"Cash: ${cash:.2f}\n"
+                f"Equity: ${eq:.2f}\n"
+                f"Profit: ${float(learning.get('total_profit', 0.0)):.2f}\n\n"
                 f"Open: {len(positions)}\n\n"
                 f"Trades: {int(learning.get('trade_count', 0))}\n"
                 f"Wins: {int(learning.get('win_count', 0))}\n"
                 f"Losses: {int(learning.get('loss_count', 0))}\n"
                 f"Winrate: {winrate():.1f}%\n\n"
-                f"ML: {'ACTIVE' if ml_active else 'LEARNING'}"
+                f"ML: {'ACTIVE' if ml_active else 'LEARNING'}\n"
+                f"Paused(buys): {BOT_PAUSED}"
             )
 
             last_status = now
@@ -420,5 +515,5 @@ while True:
         time.sleep(1)
 
     except Exception:
-        notify(traceback.format_exc())
+        notify(f"[{INSTANCE_ID}] ERROR\n{traceback.format_exc()}")
         time.sleep(5)
