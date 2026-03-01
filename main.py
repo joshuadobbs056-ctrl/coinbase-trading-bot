@@ -1,10 +1,9 @@
 # Coin Sniper — Savage Mode ELITE
-# ML Enabled + GitHub Persistence + Auto File Creation
+# ML Enabled + GitHub Persistence + Controlled Loop Version
 
 import os
 import time
 import json
-import csv
 import traceback
 import requests
 import numpy as np
@@ -15,14 +14,18 @@ from sklearn.ensemble import RandomForestClassifier
 # =========================
 
 START_BALANCE = float(os.getenv("START_BALANCE", 1000))
+
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
+
+SAVE_INTERVAL = 60
+ML_INTERVAL = 300
+GITHUB_INTERVAL = 300
 
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
 MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 25))
 
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
-TRAIL_START = float(os.getenv("TRAILING_START_PERCENT", 1.2))
 TRAIL_DIST = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
 
 COOLDOWN_SECONDS = 180
@@ -44,9 +47,8 @@ GITHUB_REPO = os.getenv("GITHUB_REPO")
 
 LEARNING_FILE = "learning.json"
 POSITIONS_FILE = "positions.json"
-HISTORY_FILE = "trade_history.csv"
 COOLDOWN_FILE = "cooldown.json"
-MODEL_FILE = "ml_model.json"
+HISTORY_FILE = "trade_history.csv"
 
 # =========================
 # TELEGRAM
@@ -71,7 +73,7 @@ def notify(msg):
 
 
 # =========================
-# AUTO FILE CREATION
+# FILE CREATION
 # =========================
 
 def ensure_files():
@@ -104,9 +106,7 @@ def ensure_files():
         with open(HISTORY_FILE,"w") as f:
             f.write("profit\n")
 
-
 ensure_files()
-
 
 # =========================
 # LOAD / SAVE
@@ -122,9 +122,8 @@ def save_json(file,data):
     with open(file,"w") as f:
         json.dump(data,f)
 
-
 # =========================
-# GITHUB AUTO SAVE
+# GITHUB BACKUP
 # =========================
 
 def github_upload(filename):
@@ -134,29 +133,26 @@ def github_upload(filename):
 
     try:
 
+        import base64
+
         with open(filename,"r") as f:
             content = f.read()
-
-        import base64
 
         encoded = base64.b64encode(content.encode()).decode()
 
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
 
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}"
-        }
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
         r = requests.get(url, headers=headers)
 
         sha = None
 
         if r.status_code == 200:
-
             sha = r.json()["sha"]
 
         data = {
-            "message": f"Auto update {filename}",
+            "message": f"Update {filename}",
             "content": encoded,
             "branch": "main"
         }
@@ -177,7 +173,6 @@ def github_backup_all():
     github_upload(COOLDOWN_FILE)
     github_upload(HISTORY_FILE)
 
-
 # =========================
 # STATE
 # =========================
@@ -187,7 +182,6 @@ positions = load_json(POSITIONS_FILE)
 cooldown = load_json(COOLDOWN_FILE)
 
 cash = learning["cash"]
-
 
 # =========================
 # MARKET DATA
@@ -200,9 +194,6 @@ def get_price(symbol):
         r = requests.get(f"{BASE_URL}/{symbol}/ticker", timeout=10)
 
         data = r.json()
-
-        if "price" not in data:
-            return None
 
         return float(data["price"])
 
@@ -229,12 +220,10 @@ def get_symbols():
 
         return []
 
-
 symbols = get_symbols()
 
-
 # =========================
-# ML SYSTEM
+# ML
 # =========================
 
 model = None
@@ -254,19 +243,16 @@ def train_model():
             return
 
         X = np.arange(len(data)).reshape(-1,1)
-
         y = (data > 0).astype(int)
 
         model = RandomForestClassifier(n_estimators=100)
 
         model.fit(X,y)
 
-        notify("ML MODEL TRAINED")
+        notify("ML TRAINED")
 
     except:
-
         pass
-
 
 # =========================
 # EQUITY
@@ -283,7 +269,6 @@ def equity(prices):
             total += pos["qty"] * prices[sym]
 
     return total
-
 
 # =========================
 # OPEN TRADE
@@ -325,7 +310,6 @@ def open_trade(sym, price):
 
     notify(f"BUY {sym} @ {price}")
 
-
 # =========================
 # SELL TRADE
 # =========================
@@ -338,14 +322,13 @@ def sell_trade(sym, price):
 
     proceeds = pos["qty"] * price
 
-    size = pos["qty"] * pos["entry"]
+    entry_value = pos["qty"] * pos["entry"]
 
-    profit = proceeds - size
+    profit = proceeds - entry_value
 
     cash += proceeds
 
     learning["cash"] = cash
-
     learning["trade_count"] += 1
 
     if profit > 0:
@@ -356,7 +339,6 @@ def sell_trade(sym, price):
     learning["total_profit"] += profit
 
     with open(HISTORY_FILE,"a") as f:
-
         f.write(f"{profit}\n")
 
     cooldown[sym] = time.time()
@@ -365,106 +347,102 @@ def sell_trade(sym, price):
 
     notify(f"SELL {sym} Profit: {profit:.2f}")
 
-
 # =========================
-# SAVE
-# =========================
-
-def save_all():
-
-    save_json(LEARNING_FILE, learning)
-    save_json(POSITIONS_FILE, positions)
-    save_json(COOLDOWN_FILE, cooldown)
-
-    github_backup_all()
-
-
-# =========================
-# START
+# TIMERS
 # =========================
 
-notify(f"BOT STARTED — ELITE MODE\nCash: ${cash:.2f}")
+last_scan = 0
+last_status = 0
+last_save = 0
+last_ml = 0
+last_github = 0
 
-last_status = time.time()
-
-train_model()
-
+notify(f"BOT STARTED\nCash: {cash}")
 
 # =========================
-# MAIN LOOP
+# CONTROLLED LOOP
 # =========================
 
 while True:
 
     try:
 
+        now = time.time()
+
         prices = {}
 
-        for sym in symbols:
+        # SCAN
+        if now - last_scan >= SCAN_INTERVAL:
 
-            price = get_price(sym)
+            for sym in symbols:
 
-            if price:
+                price = get_price(sym)
 
-                prices[sym] = price
+                if price:
+                    prices[sym] = price
 
+            for sym in list(positions):
 
-        # SELL LOGIC
+                price = prices.get(sym)
 
-        for sym in list(positions):
+                if not price:
+                    continue
 
-            price = prices.get(sym)
+                pos = positions[sym]
 
-            if not price:
-                continue
+                if price > pos["peak"]:
+                    pos["peak"] = price
 
-            pos = positions[sym]
+                trail = pos["peak"]*(1-TRAIL_DIST/100)
 
-            if price > pos["peak"]:
-                pos["peak"] = price
+                if price <= pos["stop"] or price <= trail:
 
-            trail = pos["peak"]*(1-TRAIL_DIST/100)
+                    sell_trade(sym, price)
 
-            if price <= pos["stop"] or price <= trail:
+            for sym in symbols:
 
-                sell_trade(sym, price)
+                if sym in prices:
 
+                    open_trade(sym, prices[sym])
 
-        # BUY LOGIC
-
-        for sym in symbols:
-
-            if sym in prices:
-
-                open_trade(sym, prices[sym])
-
+            last_scan = now
 
         # STATUS
-
-        if time.time() - last_status > STATUS_INTERVAL:
+        if now - last_status >= STATUS_INTERVAL:
 
             eq = equity(prices)
 
-            notify(
-                f"STATUS\n"
-                f"Cash: {cash:.2f}\n"
-                f"Equity: {eq:.2f}\n"
-                f"Trades: {learning['trade_count']}\n"
-                f"Profit: {learning['total_profit']:.2f}"
-            )
+            notify(f"Equity: {eq:.2f} Profit: {learning['total_profit']:.2f}")
 
-            last_status = time.time()
+            last_status = now
 
+        # SAVE
+        if now - last_save >= SAVE_INTERVAL:
 
-        save_all()
+            save_json(LEARNING_FILE, learning)
+            save_json(POSITIONS_FILE, positions)
+            save_json(COOLDOWN_FILE, cooldown)
 
-        train_model()
+            last_save = now
 
-        time.sleep(SCAN_INTERVAL)
+        # ML
+        if now - last_ml >= ML_INTERVAL:
 
+            train_model()
 
-    except Exception as e:
+            last_ml = now
 
-        notify(f"ERROR\n{traceback.format_exc()}")
+        # GITHUB
+        if now - last_github >= GITHUB_INTERVAL:
 
-        time.sleep(10)
+            github_backup_all()
+
+            last_github = now
+
+        time.sleep(1)
+
+    except Exception:
+
+        notify(traceback.format_exc())
+
+        time.sleep(5)
