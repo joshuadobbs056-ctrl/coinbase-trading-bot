@@ -1,9 +1,9 @@
 # Coin Sniper — Savage Mode ELITE (STABLE)
 # ✅ Single-instance lock
 # ✅ Persistent files
-# ✅ GitHub backup on timer (no spam)
+# ✅ GitHub backup to DATA repo (NOT deploy repo)
 # ✅ Correct stats: wins/losses/open/profit/equity
-# ✅ Pause support (pause buys, keep sell protection)
+# ✅ Pause support
 
 import os
 import time
@@ -27,7 +27,6 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 def acquire_lock_or_exit():
-    # If lock exists and PID alive -> exit to prevent duplicates (within same container)
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
@@ -35,27 +34,22 @@ def acquire_lock_or_exit():
             if raw:
                 old_pid = int(raw.split("|")[0])
                 if old_pid and _pid_alive(old_pid):
-                    print(f"[LOCK] Another instance running (pid={old_pid}). Exiting.")
+                    print(f"[LOCK] Instance already running (pid={old_pid})")
                     raise SystemExit(0)
         except SystemExit:
             raise
-        except Exception:
+        except:
             pass
 
-    # Write our PID
-    try:
-        with open(LOCK_FILE, "w") as f:
-            f.write(f"{os.getpid()}|{int(time.time())}")
-    except Exception:
-        print("[LOCK] Unable to create lock file. Exiting.")
-        raise SystemExit(0)
+    with open(LOCK_FILE, "w") as f:
+        f.write(f"{os.getpid()}|{int(time.time())}")
 
 acquire_lock_or_exit()
 
-INSTANCE_ID = os.getenv("INSTANCE_ID", str(os.getpid()))
+INSTANCE_ID = str(os.getpid())
 
 # =========================
-# CONFIG (ENV)
+# CONFIG
 # =========================
 
 START_BALANCE = float(os.getenv("START_BALANCE", 1000))
@@ -78,15 +72,16 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
 ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
 ML_ENABLE_AFTER = int(os.getenv("ML_ENABLE_AFTER", 25))
 
-BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"  # pauses NEW buys only
+BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
 
 BASE_URL = "https://api.exchange.coinbase.com/products"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ✅ THIS IS THE IMPORTANT FIX
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_REPO = os.getenv("GITHUB_DATA_REPO")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
 # =========================
@@ -102,409 +97,317 @@ HISTORY_FILE = "trade_history.csv"
 # TELEGRAM
 # =========================
 
-def notify(msg: str):
+def notify(msg):
     print(msg)
+
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                timeout=10,
+                timeout=10
             )
-        except Exception:
+        except:
             pass
 
 # =========================
-# AUTO FILE CREATION
+# FILE INIT
 # =========================
 
 def ensure_files():
+
     if not os.path.exists(LEARNING_FILE):
-        with open(LEARNING_FILE, "w") as f:
+        with open(LEARNING_FILE,"w") as f:
             json.dump({
                 "cash": START_BALANCE,
-                "start_balance": START_BALANCE,
                 "trade_count": 0,
                 "win_count": 0,
                 "loss_count": 0,
-                "total_profit": 0.0
+                "total_profit": 0
             }, f)
 
     if not os.path.exists(POSITIONS_FILE):
-        with open(POSITIONS_FILE, "w") as f:
+        with open(POSITIONS_FILE,"w") as f:
             json.dump({}, f)
 
     if not os.path.exists(COOLDOWN_FILE):
-        with open(COOLDOWN_FILE, "w") as f:
+        with open(COOLDOWN_FILE,"w") as f:
             json.dump({}, f)
 
     if not os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "w") as f:
+        with open(HISTORY_FILE,"w") as f:
             f.write("profit\n")
 
 ensure_files()
 
 # =========================
-# LOAD / SAVE
+# LOAD STATE
 # =========================
 
 def load_json(path, default):
     try:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
+        with open(path,"r") as f:
+            return json.load(f)
+    except:
+        return default
 
-def save_json(path, data):
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass
+learning = load_json(LEARNING_FILE, {})
+positions = load_json(POSITIONS_FILE, {})
+cooldown = load_json(COOLDOWN_FILE, {})
+
+cash = float(learning.get("cash", START_BALANCE))
+learning["cash"] = cash
 
 # =========================
-# GITHUB BACKUP (TIMED)
+# GITHUB BACKUP
 # =========================
 
-def github_upload(filename: str):
+def github_upload(filename):
+
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return
 
     try:
+
         import base64
 
-        with open(filename, "r") as f:
+        with open(filename,"r") as f:
             content = f.read()
 
         encoded = base64.b64encode(content.encode()).decode()
+
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+
         headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers)
+
         sha = None
         if r.status_code == 200:
-            sha = r.json().get("sha")
+            sha = r.json()["sha"]
 
         payload = {
-            "message": f"Auto update {filename}",
+            "message": f"update {filename}",
             "content": encoded,
             "branch": GITHUB_BRANCH
         }
+
         if sha:
             payload["sha"] = sha
 
-        requests.put(url, headers=headers, json=payload, timeout=20)
+        requests.put(url, headers=headers, json=payload)
 
-    except Exception:
+    except:
         pass
 
 def github_backup_all():
+
     github_upload(LEARNING_FILE)
     github_upload(POSITIONS_FILE)
     github_upload(COOLDOWN_FILE)
     github_upload(HISTORY_FILE)
 
 # =========================
-# STATE
+# MARKET
 # =========================
 
-learning = load_json(LEARNING_FILE, {
-    "cash": START_BALANCE,
-    "start_balance": START_BALANCE,
-    "trade_count": 0,
-    "win_count": 0,
-    "loss_count": 0,
-    "total_profit": 0.0
-})
+def get_price(sym):
 
-positions = load_json(POSITIONS_FILE, {})
-cooldown = load_json(COOLDOWN_FILE, {})
-
-# Keep cash in ONE place (global), always sync with learning["cash"]
-cash = float(learning.get("cash", START_BALANCE))
-learning["cash"] = cash
-
-# =========================
-# MARKET DATA
-# =========================
-
-def get_price(symbol: str):
     try:
-        r = requests.get(f"{BASE_URL}/{symbol}/ticker", timeout=10)
-        data = r.json()
-        if "price" not in data:
-            return None
-        return float(data["price"])
-    except Exception:
+        r = requests.get(f"{BASE_URL}/{sym}/ticker", timeout=10)
+        return float(r.json()["price"])
+    except:
         return None
 
 def get_symbols():
+
     try:
-        r = requests.get(BASE_URL, timeout=10)
+        r = requests.get(BASE_URL)
         data = r.json()
-        # USD quote only
-        syms = [
-            p["id"]
-            for p in data
-            if p.get("quote_currency") == "USD"
-        ]
-        return syms[:60]
-    except Exception:
+        return [x["id"] for x in data if x["quote_currency"]=="USD"][:60]
+    except:
         return []
 
 symbols = get_symbols()
 
 # =========================
-# ML (TRAINING ONLY)
-# =========================
-
-model = None
-
-def train_model():
-    global model
-    if not ML_ENABLED:
-        return
-    try:
-        data = np.genfromtxt(HISTORY_FILE, delimiter=",", skip_header=1)
-        if data is None:
-            return
-        if np.isscalar(data):
-            data = np.array([float(data)])
-
-        if len(data) < ML_ENABLE_AFTER:
-            return
-
-        X = np.arange(len(data)).reshape(-1, 1)
-        y = (data > 0).astype(int)
-
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X, y)
-
-        notify(f"[{INSTANCE_ID}] ML TRAINED | trades={len(data)}")
-
-    except Exception:
-        pass
-
-# =========================
 # STATS
 # =========================
 
-def equity(prices: dict) -> float:
+def equity(prices):
+
     total = cash
-    for sym, pos in positions.items():
-        px = prices.get(sym)
-        if px:
-            total += float(pos["qty"]) * float(px)
-    return float(total)
 
-def winrate() -> float:
-    t = int(learning.get("trade_count", 0))
-    w = int(learning.get("win_count", 0))
-    return (w / t * 100.0) if t > 0 else 0.0
+    for sym,pos in positions.items():
+
+        if sym in prices:
+            total += pos["qty"] * prices[sym]
+
+    return total
 
 # =========================
-# TRADING
+# TRADE
 # =========================
 
-def open_trade(sym: str, price: float):
+def open_trade(sym,price):
+
     global cash
 
     if sym in positions:
         return
-    if len(positions) >= MAX_OPEN_TRADES:
+
+    if len(positions)>=MAX_OPEN_TRADES:
         return
 
-    now = time.time()
-    last = cooldown.get(sym)
-    if last and (now - float(last)) < COOLDOWN_SECONDS:
+    size = min(MIN_TRADE_SIZE,cash)
+
+    if size<MIN_TRADE_SIZE:
         return
 
-    # fixed-size for now (min trade size), safe
-    size = min(MIN_TRADE_SIZE, cash)
-    if size < MIN_TRADE_SIZE:
-        return
+    qty=size/price
 
-    qty = size / price
-
-    positions[sym] = {
-        "entry": float(price),
-        "qty": float(qty),
-        "peak": float(price),
-        "stop": float(price) * (1 - STOP_LOSS_PERCENT / 100.0)
+    positions[sym]={
+        "entry":price,
+        "qty":qty,
+        "peak":price,
+        "stop":price*(1-STOP_LOSS_PERCENT/100)
     }
 
-    cash -= size
-    learning["cash"] = cash
+    cash-=size
+    learning["cash"]=cash
 
-    notify(f"[{INSTANCE_ID}] BUY {sym} @ {price:.6f} | size=${size:.2f} | cash=${cash:.2f} | open={len(positions)}")
+    notify(f"BUY {sym} ${price:.4f}")
 
-def sell_trade(sym: str, price: float):
+def sell_trade(sym,price):
+
     global cash
 
-    if sym not in positions:
-        return
+    pos=positions[sym]
 
-    pos = positions[sym]
+    proceeds=pos["qty"]*price
+    cost=pos["qty"]*pos["entry"]
 
-    entry = float(pos["entry"])
-    qty = float(pos["qty"])
+    profit=proceeds-cost
 
-    proceeds = qty * float(price)
-    cost = qty * entry
-    profit = proceeds - cost
+    cash+=proceeds
 
-    cash += proceeds
-    learning["cash"] = cash
+    learning["cash"]=cash
+    learning["trade_count"]+=1
 
-    learning["trade_count"] = int(learning.get("trade_count", 0)) + 1
-    if profit > 0:
-        learning["win_count"] = int(learning.get("win_count", 0)) + 1
+    if profit>0:
+        learning["win_count"]+=1
     else:
-        learning["loss_count"] = int(learning.get("loss_count", 0)) + 1
+        learning["loss_count"]+=1
 
-    learning["total_profit"] = float(learning.get("total_profit", 0.0)) + float(profit)
+    learning["total_profit"]+=profit
 
-    # write history for ML
-    try:
-        with open(HISTORY_FILE, "a") as f:
-            f.write(f"{profit}\n")
-    except Exception:
-        pass
+    with open(HISTORY_FILE,"a") as f:
+        f.write(f"{profit}\n")
 
-    cooldown[sym] = time.time()
+    cooldown[sym]=time.time()
+
     del positions[sym]
 
-    notify(f"[{INSTANCE_ID}] SELL {sym} @ {price:.6f} | profit=${profit:.2f} | cash=${cash:.2f} | open={len(positions)}")
+    notify(f"SELL {sym} profit ${profit:.2f}")
 
 # =========================
 # SAVE
 # =========================
 
-def save_all_local():
-    save_json(LEARNING_FILE, learning)
-    save_json(POSITIONS_FILE, positions)
-    save_json(COOLDOWN_FILE, cooldown)
+def save_all():
+
+    with open(LEARNING_FILE,"w") as f:
+        json.dump(learning,f)
+
+    with open(POSITIONS_FILE,"w") as f:
+        json.dump(positions,f)
+
+    with open(COOLDOWN_FILE,"w") as f:
+        json.dump(cooldown,f)
 
 # =========================
-# STARTUP MESSAGE
+# START
 # =========================
 
-notify(
-    f"[{INSTANCE_ID}] BOT STARTED\n"
-    f"Cash: ${cash:.2f}\n"
-    f"Open: {len(positions)}\n"
-    f"Paused(buys): {BOT_PAUSED}\n"
-    f"Lock: {LOCK_FILE}"
-)
+notify(f"BOT STARTED | Repo: {GITHUB_REPO}")
 
 # =========================
-# TIMERS
+# LOOP
 # =========================
 
-last_scan = 0
-last_status = 0
-last_save = 0
-last_ml = 0
-last_github = 0
+last_scan=0
+last_status=0
+last_save=0
+last_github=0
 
-# keep last prices for equity between scans
-last_prices = {}
-
-# =========================
-# MAIN LOOP (CONTROLLED)
-# =========================
+prices={}
 
 while True:
+
     try:
-        now = time.time()
 
-        # Refresh pause flag without redeploy (Railway vars apply on restart,
-        # but this also supports environments that live-update env)
-        BOT_PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
+        now=time.time()
 
-        # SCAN + TRADE
-        if now - last_scan >= SCAN_INTERVAL:
-            prices = {}
+        if now-last_scan>=SCAN_INTERVAL:
 
             for sym in symbols:
-                px = get_price(sym)
-                if px:
-                    prices[sym] = px
 
-            # store for status/equity
-            if prices:
-                last_prices = prices
+                p=get_price(sym)
 
-            # SELL MANAGEMENT (always runs, even when paused)
-            for sym in list(positions.keys()):
-                px = prices.get(sym) or last_prices.get(sym)
-                if not px:
+                if p:
+                    prices[sym]=p
+
+            for sym in list(positions):
+
+                price=prices.get(sym)
+
+                if not price:
                     continue
 
-                pos = positions[sym]
-                px = float(px)
+                pos=positions[sym]
 
-                # update peak
-                if px > float(pos["peak"]):
-                    pos["peak"] = px
+                if price>pos["peak"]:
+                    pos["peak"]=price
 
-                # trailing stop
-                trail = float(pos["peak"]) * (1 - TRAIL_DIST / 100.0)
+                trail=pos["peak"]*(1-TRAIL_DIST/100)
 
-                if px <= float(pos["stop"]) or px <= float(trail):
-                    sell_trade(sym, px)
+                if price<=pos["stop"] or price<=trail:
+                    sell_trade(sym,price)
 
-            # BUY LOGIC (disabled when paused)
             if not BOT_PAUSED:
                 for sym in symbols:
-                    px = prices.get(sym)
-                    if px:
-                        open_trade(sym, float(px))
+                    if sym in prices:
+                        open_trade(sym,prices[sym])
 
-            last_scan = now
+            last_scan=now
 
-        # STATUS
-        if now - last_status >= STATUS_INTERVAL:
-            eq = equity(last_prices if isinstance(last_prices, dict) else {})
-            t = int(learning.get("trade_count", 0))
-            w = int(learning.get("win_count", 0))
-            l = int(learning.get("loss_count", 0))
-            p = float(learning.get("total_profit", 0.0))
-            o = len(positions)
-            wr = winrate()
+        if now-last_status>=STATUS_INTERVAL:
+
+            eq=equity(prices)
 
             notify(
-                f"[{INSTANCE_ID}] STATUS\n"
-                f"Cash: ${cash:.2f}\n"
-                f"Equity: ${eq:.2f}\n"
-                f"Profit: ${p:.2f}\n"
-                f"Open: {o}\n"
-                f"Trades: {t} | Wins: {w} | Losses: {l} | Winrate: {wr:.1f}%\n"
-                f"Paused(buys): {BOT_PAUSED}"
+                f"STATUS | Cash ${cash:.2f} | Equity ${eq:.2f} | "
+                f"Profit ${learning['total_profit']:.2f} | "
+                f"Wins {learning['win_count']} | "
+                f"Losses {learning['loss_count']} | "
+                f"Open {len(positions)}"
             )
-            last_status = now
 
-        # SAVE LOCAL
-        if now - last_save >= SAVE_INTERVAL:
-            save_all_local()
-            last_save = now
+            last_status=now
 
-        # ML TRAIN (timed)
-        if now - last_ml >= ML_INTERVAL:
-            train_model()
-            last_ml = now
+        if now-last_save>=SAVE_INTERVAL:
 
-        # GITHUB BACKUP (timed)
-        if now - last_github >= GITHUB_INTERVAL:
+            save_all()
+            last_save=now
+
+        if now-last_github>=GITHUB_INTERVAL:
+
             github_backup_all()
-            last_github = now
+            last_github=now
 
         time.sleep(1)
 
-    except SystemExit:
-        raise
-    except Exception:
-        notify(f"[{INSTANCE_ID}] ERROR\n{traceback.format_exc()}")
+    except Exception as e:
+
+        notify(traceback.format_exc())
         time.sleep(5)
