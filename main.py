@@ -1,4 +1,4 @@
-# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED + SCAN LOGS + HISTORY GATE + DYNAMIC SIZING)
+# Coin Sniper — Savage Mode ELITE (MAX PROFIT BUILD — ML TELEGRAM FIXED + SCAN LOGS + HISTORY GATE + DYNAMIC SIZING + TRAILING STOP)
 
 import os
 import time
@@ -49,6 +49,8 @@ MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
 MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 25))
 
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
+
+# Trailing stop distance (%). Example: 0.9 means trail stop is 0.9% below peak.
 TRAIL_DIST_BASE = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
 
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 180))
@@ -60,16 +62,16 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
 EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
 
 # Bigger buys (Railway-controlled)
-CASH_RESERVE_PERCENT = float(os.getenv("CASH_RESERVE_PERCENT", 5))          # keep this % cash unspent
+CASH_RESERVE_PERCENT = float(os.getenv("CASH_RESERVE_PERCENT", 5))           # keep this % cash unspent
 MIN_POSITION_SIZE_PERCENT = float(os.getenv("MIN_POSITION_SIZE_PERCENT", 3)) # smallest buy % (of usable cash)
 MAX_POSITION_SIZE_PERCENT = float(os.getenv("MAX_POSITION_SIZE_PERCENT", 8)) # largest buy % (of usable cash)
 
 # History requirements (so we don't trade until we have enough data)
-HISTORY_POINTS_REQUIRED = int(os.getenv("HISTORY_POINTS_REQUIRED", 40))   # score needs 40 points (uses 20 & 40)
-MIN_HISTORY_COINS = int(os.getenv("MIN_HISTORY_COINS", 50))              # must have >= this many coins "ready"
+HISTORY_POINTS_REQUIRED = int(os.getenv("HISTORY_POINTS_REQUIRED", 40))
+MIN_HISTORY_COINS = int(os.getenv("MIN_HISTORY_COINS", 50))
 
 # Scan log throttle (prevents Telegram spam)
-SCAN_LOG_INTERVAL = int(os.getenv("SCAN_LOG_INTERVAL", 60))              # seconds between SCANNING/HISTORY messages
+SCAN_LOG_INTERVAL = int(os.getenv("SCAN_LOG_INTERVAL", 60))
 
 # ML
 ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
@@ -119,10 +121,7 @@ def ensure_files():
             "total_profit": 0.0
         }, open(LEARNING_FILE, "w"))
 
-    for f, d in [
-        (POSITIONS_FILE, {}),
-        (COOLDOWN_FILE, {})
-    ]:
+    for f, d in [(POSITIONS_FILE, {}), (COOLDOWN_FILE, {})]:
         if not os.path.exists(f):
             json.dump(d, open(f, "w"))
 
@@ -187,7 +186,6 @@ def get_symbols():
         if EXCLUDE:
             syms = [s for s in syms if s not in EXCLUDE]
 
-        # remove obvious stables even if EXCLUDE not set
         stables = {"USDC-USD", "USDT-USD", "DAI-USD", "TUSD-USD", "USD1-USD"}
         syms = [s for s in syms if s not in stables]
 
@@ -242,7 +240,6 @@ def extract_features(sym, price, score):
     mom = (price - mean20) / mean20
     vol = a20.std() / mean20
     trend = (mean20 - mean40) / mean40
-    # placeholders for future expansion:
     return [float(score), float(mom), float(vol), float(trend), 0.0, 0.0]
 
 # =========================
@@ -258,7 +255,6 @@ def train_model():
     try:
         data = np.genfromtxt(ML_TRAIN_FILE, delimiter=",", skip_header=1)
 
-        # empty-safe
         if data is None or (hasattr(data, "size") and data.size == 0):
             now = time.time()
             if now - last_ml_learning_note >= 300:
@@ -266,7 +262,6 @@ def train_model():
                 last_ml_learning_note = now
             return
 
-        # 1 row => 1D array
         if isinstance(data, np.ndarray) and data.ndim == 1:
             data = np.array([data], dtype=float)
 
@@ -318,20 +313,13 @@ def winrate():
 # =========================
 
 def calc_position_size_usd(score: int) -> float:
-    """
-    Uses CASH_RESERVE_PERCENT to keep cash aside.
-    Uses MIN_POSITION_SIZE_PERCENT..MAX_POSITION_SIZE_PERCENT for size, scaled by score.
-    """
     global cash
 
-    # reserve guard
     reserve = cash * (CASH_RESERVE_PERCENT / 100.0)
     usable = max(0.0, cash - reserve)
     if usable < MIN_TRADE_SIZE:
         return 0.0
 
-    # scale position % by score strength (score 0..10)
-    # If ENTRY_SCORE_MIN is 7, score=7 -> near MIN%, score=10 -> MAX%
     denom = max(1, (10 - ENTRY_SCORE_MIN))
     strength = (score - ENTRY_SCORE_MIN) / denom
     strength = max(0.0, min(1.0, strength))
@@ -341,12 +329,10 @@ def calc_position_size_usd(score: int) -> float:
 
     size = usable * (pct / 100.0)
 
-    # hard minimum + cap
     if size < MIN_TRADE_SIZE:
         size = MIN_TRADE_SIZE
     size = min(size, usable)
 
-    # final safety
     if size > cash:
         size = cash
     return float(size)
@@ -369,7 +355,6 @@ def open_trade(sym, price, score):
     if not features:
         return
 
-    # ML gate only when model trained
     if ml_model is not None:
         try:
             prob = float(ml_model.predict_proba([features])[0][1])
@@ -414,13 +399,43 @@ def sell_trade(sym, price, reason):
 
     open(HISTORY_FILE, "a").write(f"{profit}\n")
 
-    # ML row
     outcome = 1 if profit > 0 else 0
     open(ML_TRAIN_FILE, "a").write(",".join(map(str, pos["features"])) + f",{outcome}\n")
 
     del positions[sym]
 
     notify(f"[{INSTANCE_ID}] SELL {sym} @ {price:.6f} | {reason} | profit=${profit:.2f} | cash=${cash:.2f} | open={len(positions)}")
+
+# =========================
+# TRAILING STOP (ACTIVE)
+# =========================
+
+def apply_trailing_stop(sym: str, pos: dict, px: float) -> None:
+    """
+    True trailing stop:
+      - Updates peak when price makes a new high
+      - Tightens stop to (peak * (1 - trail%))
+      - Never loosens stop
+    """
+    try:
+        px = float(px)
+        peak = float(pos.get("peak", pos["entry"]))
+        stop = float(pos.get("stop", 0.0))
+
+        # new peak?
+        if px > peak:
+            peak = px
+            pos["peak"] = peak
+
+        # candidate trailing stop based on peak
+        trail_stop = peak * (1.0 - (TRAIL_DIST_BASE / 100.0))
+
+        # only tighten, never loosen
+        if trail_stop > stop:
+            pos["stop"] = trail_stop
+
+    except Exception:
+        pass
 
 # =========================
 # STARTUP
@@ -433,6 +448,7 @@ notify(
     f"EntryScoreMin: {ENTRY_SCORE_MIN}\n"
     f"History gate: need >= {MIN_HISTORY_COINS} coins with >= {HISTORY_POINTS_REQUIRED} points\n"
     f"Sizing: reserve={CASH_RESERVE_PERCENT:.1f}% | pos% {MIN_POSITION_SIZE_PERCENT:.1f}-{MAX_POSITION_SIZE_PERCENT:.1f}\n"
+    f"Stops: SL={STOP_LOSS_PERCENT:.2f}% | TRAIL={TRAIL_DIST_BASE:.3f}%\n"
     f"Paused(buys): {BOT_PAUSED}"
 )
 
@@ -459,11 +475,18 @@ while True:
             if prices:
                 last_prices = prices
 
-            # stop-loss management
+            # stop-loss + trailing management
             for sym, pos in list(positions.items()):
                 px = prices.get(sym)
-                if px and float(px) <= float(pos["stop"]):
-                    sell_trade(sym, px, "STOP")
+                if not px:
+                    continue
+
+                # 1) tighten stop via trailing logic first
+                apply_trailing_stop(sym, pos, float(px))
+
+                # 2) then check stop
+                if float(px) <= float(pos["stop"]):
+                    sell_trade(sym, float(px), "STOP/TRAIL")
 
             # history readiness
             ready = sum(1 for s in price_history if len(price_history[s]) >= HISTORY_POINTS_REQUIRED)
