@@ -60,6 +60,10 @@ MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", 25))
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
 TRAIL_DIST_BASE = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
 
+# ✅ NEW: minimum profit (in %) required before trailing stop starts tightening
+# Example: 0.8 means price must be +0.8% above entry before trailing begins
+MIN_PROFIT_BEFORE_TRAIL = float(os.getenv("MIN_PROFIT_BEFORE_TRAIL", 0.8))
+
 ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", 7))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
 
@@ -443,9 +447,23 @@ def record_history(action, sym, price, qty, notional, profit, cash_now, equity_n
 # =========================
 
 def apply_trailing_stop(pos, price):
-    peak = float(pos.get("peak", pos["entry"]))
+    """
+    ✅ Trailing only activates after MIN_PROFIT_BEFORE_TRAIL% is reached.
+    Until then, stop stays as the initial hard stop (STOP_LOSS_PERCENT).
+    """
+    entry = float(pos.get("entry", price))
+
+    # Always track peak
+    peak = float(pos.get("peak", entry))
     if price > peak:
         pos["peak"] = price
+
+    # Only start trailing once trade has at least MIN_PROFIT_BEFORE_TRAIL% unrealized profit
+    trigger_px = entry * (1.0 + (MIN_PROFIT_BEFORE_TRAIL / 100.0))
+    if price < trigger_px:
+        return
+
+    # Now tighten trailing stop
     trail = float(pos["peak"]) * (1 - TRAIL_DIST_BASE / 100.0)
     if trail > float(pos["stop"]):
         pos["stop"] = trail
@@ -624,9 +642,6 @@ while True:
     try:
         now = time.time()
 
-        # refresh symbols occasionally (optional)
-        # if int(now) % 3600 == 0: symbols = get_symbols()
-
         did_state_change = False
 
         if now - last_scan >= SCAN_INTERVAL:
@@ -706,14 +721,13 @@ while True:
 
                 candidates.sort(reverse=True, key=lambda x: x[0])
 
-                # pick best candidate that passes should_buy
                 chosen = None
                 chosen_reason = ""
                 chosen_score_reason = ""
 
                 equity = compute_equity(prices)
 
-                for sc, sym, sc_reason in candidates[:20]:  # look at top 20
+                for sc, sym, sc_reason in candidates[:20]:
                     ok, reason = should_buy(sym, sc, prices, equity)
                     if ok:
                         chosen = (sc, sym)
@@ -748,11 +762,7 @@ while True:
 
             # 5) GitHub sync only if state changed (or interval)
             state_hash = _hash_state_for_push(learning, positions)
-            if did_state_change:
-                github_push_all_if_needed(state_hash)
-            else:
-                # allow periodic push so you still see it alive
-                github_push_all_if_needed(state_hash)
+            github_push_all_if_needed(state_hash)
 
             last_scan = now
 
@@ -771,7 +781,8 @@ while True:
 
             notify(
                 f"[{INSTANCE_ID}] STATUS cash=${cash:.2f} equity=${eq:.2f} open_trades={len(positions)}/{MAX_OPEN_TRADES} "
-                f"trades={trades} W={wins} L={losses} win%={winpct:.1f} profit=${learning.get('total_profit',0.0):.2f}"
+                f"trades={trades} W={wins} L={losses} win%={winpct:.1f} profit=${learning.get('total_profit',0.0):.2f} "
+                f"trail_start={MIN_PROFIT_BEFORE_TRAIL:.2f}%"
             )
             last_status = now
 
