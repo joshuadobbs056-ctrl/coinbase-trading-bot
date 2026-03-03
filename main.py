@@ -84,6 +84,9 @@ CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", "200"))
 # Runner filters
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.25"))              # last vol / mean prev
 MIN_TREND_STRENGTH = float(os.getenv("MIN_TREND_STRENGTH", "0.00035"))       # slope gate (normalized)
+MACD_PRE_CROSS_MAX = float(os.getenv("MACD_PRE_CROSS_MAX", 0.002))
+MACD_PRE_CROSS_BONUS = float(os.getenv("MACD_PRE_CROSS_BONUS", 1.0))
+EMA_GOLDEN_BONUS = float(os.getenv("EMA_GOLDEN_BONUS", 1.0))
 
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
 
@@ -307,6 +310,20 @@ def get_price(sym: str):
     except Exception:
         return None
 
+def price_from_prices_or_candles(sym: str, prices: dict):
+    """Fallback to latest candle close when ticker price isn't available."""
+    px = price_from_prices_or_candles(sym, prices)
+    if px:
+        return float(px)
+    try:
+        candles = get_candles(sym)
+        if isinstance(candles, list) and len(candles) > 0:
+            return float(candles[0][4])  # most-recent candle close (Coinbase returns newest-first)
+    except Exception:
+        pass
+    return None
+
+
 def get_symbols():
     try:
         r = requests.get(BASE_URL, timeout=10)
@@ -402,7 +419,8 @@ def macd_pack(closes, fast=12, slow=26, signal=9):
     # return current/prev diff sign for cross detection
     diff_now = float(macd[-1] - sig[-1])
     diff_prev = float(macd[-2] - sig[-2])
-    return float(macd[-1]), float(sig[-1]), float(hist[-1]), diff_now, diff_prev
+    hist_prev = float(hist[-2])
+    return float(macd[-1]), float(sig[-1]), float(hist[-1]), diff_now, diff_prev, hist_prev
 
 def ema_cross(closes, fast=9, slow=21):
     closes = np.array(closes, dtype=float)
@@ -560,7 +578,7 @@ def score_symbol(sym: str, candles):
     if mp is None or ep is None:
         return None, "indicators_short"
 
-    macd, sig, hist, diff_now, diff_prev = mp
+    macd, sig, hist, diff_now, diff_prev, hist_prev = mp
     ema_now, ema_prev = ep
 
     macd_cross_up = (diff_prev <= 0.0 and diff_now > 0.0)
@@ -587,9 +605,20 @@ def score_symbol(sym: str, candles):
         score += 1.0
 
     if golden_cross:
-        score += 1.0
+        score += 1
     else:
         score -= 1.0
+
+    # PRE-CROSS ENTRY (your style): MACD still negative but rising toward zero, histogram improving
+    # This helps you get in *before* the actual MACD cross.
+    try:
+        if (diff_now is not None) and (diff_prev is not None) and (hist is not None):
+            # diff_now < 0 means MACD is still below signal (no cross yet)
+            if diff_now < 0 and diff_now > diff_prev and (hist_prev is not None) and (hist > hist_prev) and abs(diff_now) <= MACD_PRE_CROSS_MAX:
+                score += float(MACD_PRE_CROSS_BONUS)
+    except Exception:
+        pass
+
 
     # Avoid chasing late blow-offs
     if r60 >= 0.25:
@@ -633,7 +662,7 @@ def should_buy(sym, score, prices, equity, market_ok):
     if last_ts and (time.time() - last_ts) < COOLDOWN_SECONDS:
         return False, f"COOLDOWN<{COOLDOWN_SECONDS}s"
 
-    px = prices.get(sym)
+    px = price_from_prices_or_candles(sym, prices)
     if not px:
         return False, "NO_PRICE"
 
@@ -655,7 +684,7 @@ def should_buy(sym, score, prices, equity, market_ok):
 
 def open_position(sym, score, prices, equity, reason):
     global cash
-    px = prices.get(sym)
+    px = price_from_prices_or_candles(sym, prices)
     if not px:
         return False, "NO_PRICE"
     notional = compute_position_notional(score, equity)
@@ -702,7 +731,7 @@ def close_position(sym, px, reason):
 # =========================
 # SYMBOLS
 # =========================
-symbols = [s.strip() for s in COINS.split(",") if s.strip()] if COINS else get_symbols()
+symbols = get_symbols() if (not COINS or COINS.strip().upper() == "AUTO") else [s.strip() for s in COINS.split(",") if s.strip()]
 
 # =========================
 # MAIN LOOP
@@ -733,6 +762,14 @@ while True:
             # Pull tickers and build mini history (for ML + quick equity)
             for sym in symbols:
                 px = get_price(sym)
+                if not px:
+                    # ticker can fail; fall back to latest candle close
+                    try:
+                        c = get_candles(sym)
+                        if isinstance(c, list) and len(c) > 0:
+                            px = float(c[0][4])
+                    except Exception:
+                        px = None
                 if px:
                     prices[sym] = px
                     fetched += 1
@@ -757,7 +794,7 @@ while True:
 
             # Manage open positions
             for sym in list(positions.keys()):
-                px = prices.get(sym)
+                px = price_from_prices_or_candles(sym, prices)
                 if not px:
                     continue
 
