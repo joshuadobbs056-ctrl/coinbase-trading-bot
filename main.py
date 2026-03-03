@@ -1,4 +1,3 @@
-
 # Coin Sniper — MACD + Golden Cross Runner (Savage ELITE)
 # ✅ Runner scan (MACD cross + EMA golden cross + volume expansion)
 # ✅ ATR-based adaptive trailing (starts after TRAILING_START_PERCENT)
@@ -311,16 +310,25 @@ def get_price(sym: str):
         return None
 
 def price_from_prices_or_candles(sym: str, prices: dict):
-    """Fallback to latest candle close when ticker price isn't available."""
-    px = price_from_prices_or_candles(sym, prices)
-    if px:
-        return float(px)
+    """Return a usable price for sym.
+    1) Prefer the already-fetched ticker price from `prices`.
+    2) Fallback to the most-recent candle close if needed.
+    """
+    try:
+        px = prices.get(sym)
+        if px is not None:
+            return float(px)
+    except Exception:
+        pass
+
     try:
         candles = get_candles(sym)
         if isinstance(candles, list) and len(candles) > 0:
-            return float(candles[0][4])  # most-recent candle close (Coinbase returns newest-first)
+            # Coinbase returns newest-first: [time, low, high, open, close, volume]
+            return float(candles[0][4])
     except Exception:
         pass
+
     return None
 
 
@@ -527,32 +535,46 @@ def compute_position_notional(score, equity):
 # =========================
 # TRAILING STOP (ATR adaptive)
 # =========================
-def apply_trailing_stop(pos, sym: str, price: float):
-    # update peak always
-    peak = float(pos.get("peak", pos["entry"]))
-    if price > peak:
-        pos["peak"] = price
+def apply_trailing_stop(pos: dict, sym: str, price: float):
+    """Two-stage risk control:
+    - Stage 1 (profit lock): once gain >= MIN_PROFIT_BEFORE_TRAIL, move stop up to (entry + small buffer) so winners don't flip red.
+    - Stage 2 (runner trail): once gain >= TRAILING_START_PERCENT, trail using max(TRAIL_DIST_BASE, ATR_MULT * ATR%).
+    """
+    try:
+        entry = float(pos.get("entry", price))
+        if entry <= 0:
+            return
 
-    entry = float(pos["entry"])
-    if entry <= 0:
+        # Always track peak
+        peak = float(pos.get("peak", entry))
+        if price > peak:
+            peak = price
+            pos["peak"] = peak
+
+        gain_pct = (price - entry) / entry * 100.0
+
+        # Stage 1: lock some profit / breakeven+buffer
+        if gain_pct >= float(MIN_PROFIT_BEFORE_TRAIL):
+            be_stop = entry * (1.0 + float(BREAK_EVEN_BUFFER_PERCENT) / 100.0)
+            if be_stop > float(pos.get("stop", 0.0)):
+                pos["stop"] = be_stop
+
+        # Stage 2: start trailing only after meaningful green
+        if gain_pct < float(TRAILING_START_PERCENT):
+            return
+
+        candles = get_candles(sym)
+        atr_pct = _atr_percent_from_candles(candles) if candles else float(TRAIL_DIST_BASE)
+
+        trail_dist = max(float(TRAIL_DIST_BASE), float(ATR_MULT) * float(atr_pct))
+        trail_dist = min(trail_dist, 6.0)  # cap so it doesn't get useless
+
+        trail_stop = float(pos.get("peak", price)) * (1.0 - trail_dist / 100.0)
+        if trail_stop > float(pos.get("stop", 0.0)):
+            pos["stop"] = trail_stop
+    except Exception:
         return
 
-    gain_pct = (price - entry) / entry * 100.0
-    if gain_pct < TRAILING_START_PERCENT:
-        return
-
-    candles = get_candles(sym)
-    atr_pct = _atr_percent(candles) if candles else TRAIL_DIST_BASE
-    trail_dist = max(TRAIL_DIST_BASE, ATR_MULT * atr_pct)
-    trail_dist = min(trail_dist, 6.0)
-
-    trail = float(pos.get("peak", price)) * (1 - trail_dist / 100.0)
-    if trail > float(pos["stop"]):
-        pos["stop"] = trail
-        pos["trail_dist"] = float(trail_dist)
-
-# =========================
-# SCORE (MACD + Golden Cross + Runner filter)
 # =========================
 def score_symbol(sym: str, candles):
     # Need candles
