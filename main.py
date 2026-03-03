@@ -55,13 +55,29 @@ STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", 60))
 ML_INTERVAL = int(os.getenv("ML_INTERVAL", 300))
 
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", 20))
-MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", os.getenv("MIN_TRADE_SIZE_USD", 25)))
+MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", os.getenv("MIN_TRADE_SIZE_USD", "25")))
 
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 4.0))
 TRAIL_DIST_BASE = float(os.getenv("TRAILING_DISTANCE_PERCENT", 0.9))
 
-ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", os.getenv("MIN_ENTRY_SCORE", 7)))
+ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", os.getenv("MIN_ENTRY_SCORE", "7")))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
+
+MIN_TREND_STRENGTH = float(os.getenv("MIN_TREND_STRENGTH", 0.0004))
+
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 120))
+MAX_NEW_BUYS_PER_SCAN = int(os.getenv("MAX_NEW_BUYS_PER_SCAN", 2))
+
+MARKET_GUARD = os.getenv("MARKET_GUARD", "true").lower() == "true"
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTC-USD")
+BTC_WINDOW = int(os.getenv("BTC_WINDOW", 20))
+BTC_CRASH_PCT = float(os.getenv("BTC_CRASH_PCT", 2.0))
+
+PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
+SYMBOL_REFRESH_INTERVAL = int(os.getenv("SYMBOL_REFRESH_INTERVAL", 3600))
+
+COINS = os.getenv("COINS", "").strip()
+
 
 EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
 
@@ -267,7 +283,15 @@ learning["total_profit"] = float(learning.get("total_profit", 0.0))
 cash = float(learning["cash"])
 
 # in-memory price history
-price_history = {}  # sym -> list[float]
+price_history = {}
+
+# cooldown tracking
+last_buy_by_sym = {}  # sym -> ts
+last_global_buy_ts = 0
+
+# BTC market guard history
+btc_history = []
+  # sym -> list[float]
 
 # =========================
 # MARKET DATA
@@ -303,8 +327,7 @@ def get_symbols():
     except Exception:
         return []
 
-symbols = get_symbols()
-
+symbols = [s.strip() for s in COINS.split(",") if s.strip()] if COINS else get_symbols()
 # =========================
 # CANDLES (volume + ATR)
 # =========================
@@ -387,6 +410,43 @@ def ret_from_candles(candles, bars_back: int) -> float:
         return 0.0
 
 
+
+# =========================
+# INDICATORS (EMA / MACD)
+# =========================
+
+def _ema(values, period):
+    """Simple EMA over a list/np array. Returns np array same length."""
+    arr = np.array(values, dtype=float)
+    if len(arr) == 0:
+        return arr
+    alpha = 2.0 / (period + 1.0)
+    out = np.empty_like(arr)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i-1]
+    return out
+
+def macd_signal_hist(closes, fast=12, slow=26, signal=9):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < slow + signal + 2:
+        return None
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    macd = ema_fast - ema_slow
+    sig = _ema(macd, signal)
+    hist = macd - sig
+    return float(macd[-1]), float(sig[-1]), float(hist[-1]), float(macd[-2] - sig[-2])
+
+def ema_cross(closes, fast=9, slow=21):
+    closes = np.array(closes, dtype=float)
+    if len(closes) < slow + 2:
+        return None
+    ef = _ema(closes, fast)
+    es = _ema(closes, slow)
+    now = ef[-1] - es[-1]
+    prev = ef[-2] - es[-2]
+    return float(now), float(prev)
 # =========================
 # ML (PAPER LEARNING)
 # =========================
@@ -598,6 +658,16 @@ def score_symbol(sym):
     # Momentum short-term
     mom = float((arr[-1] - arr[-5]) / max(arr[-5], 1e-12))
 
+    # Trend confirmation (MACD + EMA cross) using our local price history
+    macd_now = macd_sig = macd_hist = macd_prev_diff = None
+    ema_now = ema_prev = None
+    macd_pack = macd_signal_hist(arr, fast=12, slow=26, signal=9)
+    if macd_pack is not None:
+        macd_now, macd_sig, macd_hist, macd_prev_diff = macd_pack
+    ema_pack = ema_cross(arr, fast=9, slow=21)
+    if ema_pack is not None:
+        ema_now, ema_prev = ema_pack
+
     # Build a composite score
     # Target: drift slightly positive, mom positive, vol not crazy, dd not too negative
     score = 5.0
@@ -608,6 +678,26 @@ def score_symbol(sym):
     score += np.clip(mom * 30.0, -2.0, 3.0)
     # Volatility penalty
     score -= np.clip(vol * 200.0, 0.0, 3.0)
+    
+    # MACD / EMA confirmation (prefer bullish cross + positive histogram)
+    if macd_hist is not None:
+        if macd_hist > 0:
+            score += 1.0
+        else:
+            score -= 2.0
+        # fresh MACD cross up
+        try:
+            if (macd_prev_diff is not None) and (macd_prev_diff <= 0) and ((macd_now - macd_sig) > 0):
+                score += 1.0
+        except Exception:
+            pass
+
+    if ema_now is not None:
+        if ema_now > 0:
+            score += 1.0
+        else:
+            score -= 1.0
+
     # Drawdown penalty (avoid deep dumps)
     if dd < -0.08:
         score -= 2.0
@@ -635,7 +725,7 @@ def score_symbol(sym):
             score -= 1.0
 
     score = int(max(1, min(10, round(score))))
-    reason = f"drift={drift:.3f} mom={mom:.3f} vol={vol:.4f} dd={dd:.3f}"
+    reason = f"drift={drift:.3f} mom={mom:.3f} vol={vol:.4f} dd={dd:.3f} macdH={(macd_hist if macd_hist is not None else 0.0):.4f} ema={(ema_now if ema_now is not None else 0.0):.6f}"
     return score, reason
 
 def compute_equity(latest_prices):
@@ -675,15 +765,22 @@ def compute_position_notional(score, equity):
 
     return float(notional)
 
-def should_buy(sym, score, prices, equity):
+def should_buy(sym, score, prices, equity, market_ok=True):
     if BOT_PAUSED:
         return False, "BOT_PAUSED"
+
+    if not market_ok:
+        return False, "MARKET_GUARD"
 
     if sym in EXCLUDE:
         return False, "EXCLUDED"
 
     if sym in positions:
         return False, "ALREADY_IN_POSITION"
+
+    last_ts = int(last_buy_by_sym.get(sym, 0))
+    if last_ts and (time.time() - last_ts) < COOLDOWN_SECONDS:
+        return False, f"COOLDOWN<{COOLDOWN_SECONDS}s"
 
     if len(positions) >= MAX_OPEN_TRADES:
         return False, f"MAX_OPEN_TRADES({MAX_OPEN_TRADES})"
@@ -694,6 +791,17 @@ def should_buy(sym, score, prices, equity):
 
     if score < ENTRY_SCORE_MIN:
         return False, f"SCORE<{ENTRY_SCORE_MIN}"
+
+    # Trend strength gate (runners): require positive slope over recent window
+    try:
+        feats = compute_features(sym)
+        if feats is not None:
+            slope_15 = float(feats[3])
+            if slope_15 < MIN_TREND_STRENGTH:
+                return False, f"TREND<{MIN_TREND_STRENGTH}"
+    except Exception:
+        pass
+
 
     # ML gating only after enough completed trades
     if ML_ENABLED and learning.get("trade_count", 0) >= ML_ENABLE_AFTER:
@@ -745,6 +853,8 @@ def open_position(sym, score, prices, equity, score_reason=""):
         "score": int(score),
         "score_reason": score_reason
     }
+    last_buy_by_sym[sym] = int(time.time())
+
 
     return True, f"BUY qty={qty:.6f} notional={notional:.2f} entry={entry:.6f} stop={stop:.6f}"
 
@@ -757,13 +867,19 @@ notify(f"[{INSTANCE_ID}] BOT STARTED | Symbols={len(symbols)} | scan={SCAN_INTER
 last_scan = 0
 last_status = 0
 last_ml = 0
+last_symbol_refresh = 0
+
 
 while True:
     try:
         now = time.time()
 
-        # refresh symbols occasionally (optional)
-        # if int(now) % 3600 == 0: symbols = get_symbols()
+
+        # refresh symbols (unless COINS is pinned)
+        global symbols
+        if (not COINS) and (now - last_symbol_refresh >= SYMBOL_REFRESH_INTERVAL):
+            symbols = get_symbols()
+            last_symbol_refresh = now
 
         did_state_change = False
 
@@ -784,6 +900,20 @@ while True:
 
             equity = compute_equity(prices)
 
+
+            # BTC crash guard (blocks NEW buys if BTC dumps hard)
+            market_ok = True
+            if MARKET_GUARD:
+                btc_px = get_price(BTC_SYMBOL)
+                if btc_px:
+                    btc_history.append(float(btc_px))
+                    if len(btc_history) > max(BTC_WINDOW * 3, 200):
+                        btc_history[:] = btc_history[-200:]
+                    if len(btc_history) >= BTC_WINDOW:
+                        btc_ret = (btc_history[-1] - btc_history[-BTC_WINDOW]) / max(btc_history[-BTC_WINDOW], 1e-12) * 100.0
+                        if btc_ret <= -abs(BTC_CRASH_PCT):
+                            market_ok = False
+            
             # 2) Manage open positions (trailing stop / stop hit)
             for sym, pos in list(positions.items()):
                 px = prices.get(sym)
@@ -912,39 +1042,35 @@ while True:
 
                 candidates.sort(reverse=True, key=lambda x: x[0])
 
-                # pick best candidate that passes should_buy
-                chosen = None
-                chosen_reason = ""
-                chosen_score_reason = ""
-
+                # buy up to MAX_NEW_BUYS_PER_SCAN per scan (runners)
                 equity = compute_equity(prices)
+                buys_this_scan = 0
+                rejects = 0
 
-                for sc, sym, sc_reason in candidates[:20]:  # look at top 20
-                    ok, reason = should_buy(sym, sc, prices, equity)
-                    if ok:
-                        chosen = (sc, sym)
-                        chosen_reason = reason
-                        chosen_score_reason = sc_reason
+                for sc, sym, sc_reason in candidates[:50]:
+                    if buys_this_scan >= MAX_NEW_BUYS_PER_SCAN:
                         break
+                    ok, reason = should_buy(sym, sc, prices, equity, market_ok)
+                    if not ok:
+                        rejects += 1
+                        continue
+
+                    ok2, msg = open_position(sym, sc, prices, equity, sc_reason)
+                    equity = compute_equity(prices)
+                    if ok2:
+                        notify(f"[{INSTANCE_ID}] BUY {sym} score={sc} | {msg}")
+                        record_history("BUY", sym, prices[sym], positions[sym]["qty"], positions[sym]["qty"] * prices[sym], 0.0, cash, equity, sc, sc_reason)
+                        did_state_change = True
+                        buys_this_scan += 1
                     else:
+                        notify(f"[{INSTANCE_ID}] BUY_FAIL {sym} score={sc} reason={msg}")
                         rejects += 1
 
                 if candidates:
                     top_sc, top_sym, top_sc_reason = candidates[0]
-                    notify(f"[{INSTANCE_ID}] SCAN candidates={len(candidates)} rejects={rejects} top={top_sym} score={top_sc} | {top_sc_reason}")
+                    notify(f"[{INSTANCE_ID}] SCAN candidates={len(candidates)} rejects={rejects} buys={buys_this_scan} top={top_sym} score={top_sc} | {top_sc_reason}")
                 else:
                     notify(f"[{INSTANCE_ID}] SCAN candidates=0 (no symbols meet history/score yet)")
-
-                if chosen and len(positions) < MAX_OPEN_TRADES:
-                    sc, sym = chosen
-                    ok, msg = open_position(sym, sc, prices, equity, chosen_score_reason)
-                    equity = compute_equity(prices)
-                    if ok:
-                        notify(f"[{INSTANCE_ID}] BUY {sym} score={sc} | {msg}")
-                        record_history("BUY", sym, prices[sym], positions[sym]["qty"], positions[sym]["qty"] * prices[sym], 0.0, cash, equity, sc, chosen_score_reason)
-                        did_state_change = True
-                    else:
-                        notify(f"[{INSTANCE_ID}] BUY_FAIL {sym} score={sc} reason={msg}")
 
             # 4) Persist state (cash MUST be written back)
             learning["cash"] = float(cash)
@@ -994,7 +1120,7 @@ while True:
 # Example: 0.8 means price must be +0.8% above entry before trailing begins
 MIN_PROFIT_BEFORE_TRAIL = float(os.getenv("MIN_PROFIT_BEFORE_TRAIL", 0.8))
 
-ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", 7))
+ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", os.getenv("MIN_ENTRY_SCORE", "7")))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", 60))
 
 EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
@@ -1224,8 +1350,7 @@ def get_symbols():
     except Exception:
         return []
 
-symbols = get_symbols()
-
+symbols = [s.strip() for s in COINS.split(",") if s.strip()] if COINS else get_symbols()
 # =========================
 # ML (PAPER LEARNING)
 # =========================
@@ -1485,7 +1610,7 @@ def compute_position_notional(score, equity):
 
     return float(notional)
 
-def should_buy(sym, score, prices, equity):
+def should_buy(sym, score, prices, equity, market_ok=True):
     if BOT_PAUSED:
         return False, "BOT_PAUSED"
 
@@ -1658,7 +1783,7 @@ while True:
                 equity = compute_equity(prices)
 
                 for sc, sym, sc_reason in candidates[:20]:
-                    ok, reason = should_buy(sym, sc, prices, equity)
+                    ok, reason = should_buy(sym, sc, prices, equity, market_ok)
                     if ok:
                         chosen = (sc, sym)
                         chosen_reason = reason
