@@ -10,7 +10,7 @@
 #
 # NOTE: PAPER trading only. No real orders placed.
 
-import os, time, json, csv, math, traceback, base64, hashlib
+import os, time, json, csv, traceback, base64
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -52,29 +52,31 @@ INSTANCE_ID = str(os.getpid())
 # =========================
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "6"))      # seconds
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60")) # seconds
-ML_INTERVAL = int(os.getenv("ML_INTERVAL", "300"))        # seconds
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "6"))       # seconds
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))  # seconds
+ML_INTERVAL = int(os.getenv("ML_INTERVAL", "300"))         # seconds
 
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "12"))
 MAX_NEW_BUYS_PER_SCAN = int(os.getenv("MAX_NEW_BUYS_PER_SCAN", "2"))
 MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", "35"))
 
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "4.0"))                 # hard stop
-TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", "0.8"))       # start trailing after profit >= this %
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "1.0")) # base trail distance (%)
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "4.0"))                  # hard stop
+TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", "0.8"))        # start trailing after profit >= this %
+TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "1.0"))  # base trail distance (%)
 
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_MULT = float(os.getenv("ATR_MULT", "2.0"))                                   # trail distance = max(base, ATR%*ATR_MULT)
+ATR_MULT = float(os.getenv("ATR_MULT", "2.0"))  # trail distance = max(base, ATR%*ATR_MULT)
 
 ENTRY_SCORE_MIN = int(os.getenv("ENTRY_SCORE_MIN", "7"))
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "2.0"))                   # RVOL gate (>=)
-EXTENSION_MAX = float(os.getenv("EXTENSION_MAX", "0.06"))                        # ext (price over EMA20) max before penalty
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "2.0"))  # RVOL gate (>=)
+EXTENSION_MAX = float(os.getenv("EXTENSION_MAX", "0.06"))        # ext (price over EMA20) max before penalty
 
-COOLDOWN_SECONDS_AFTER_SELL = int(os.getenv("COOLDOWN_SECONDS_AFTER_SELL", "900")) # 15 min default
+COOLDOWN_SECONDS_AFTER_SELL = int(os.getenv("COOLDOWN_SECONDS_AFTER_SELL", "900"))  # 15 min default
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
 
-# If COINS is set, only trade those symbols (comma-separated, e.g. "ETH-USD,SOL-USD")
+# If COINS is set:
+# - "" or "AUTO" => auto universe
+# - else comma-separated list, e.g. "ETH-USD,SOL-USD"
 COINS = os.getenv("COINS", "").strip()
 EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
 
@@ -84,14 +86,14 @@ CANDLE_POINTS = int(os.getenv("CANDLE_POINTS", "200"))
 
 # Market Guard
 BTC_GUARD_ENABLED = os.getenv("BTC_GUARD_ENABLED", "1") == "1"
-BTC_GUARD_DROP_PCT = float(os.getenv("BTC_GUARD_DROP_PCT", "1.0")) # % drop over window
-BTC_GUARD_WINDOW_MIN = int(os.getenv("BTC_GUARD_WINDOW_MIN", "15")) # minutes
+BTC_GUARD_DROP_PCT = float(os.getenv("BTC_GUARD_DROP_PCT", "1.0"))   # % drop over window
+BTC_GUARD_WINDOW_MIN = int(os.getenv("BTC_GUARD_WINDOW_MIN", "15"))  # minutes
 BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTC-USD")
 
 # ML gating
 ML_ENABLED = os.getenv("ML_ENABLED", "1") == "1"
 ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", "25"))
-ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", "0.55"))              # require win probability >= this
+ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", "0.55"))  # require win probability >= this
 ML_FEATURE_VERSION = 1
 
 # Persistence
@@ -143,7 +145,6 @@ def _http_get(url: str, params: Optional[dict] = None) -> Any:
     return r.json()
 
 def list_usd_products() -> List[str]:
-    # Uses Coinbase Exchange public products. Filters for -USD spot products.
     data = _http_get(f"{COINBASE_API}/products")
     syms = []
     for p in data:
@@ -155,23 +156,17 @@ def list_usd_products() -> List[str]:
                 syms.append(pid)
         except Exception:
             continue
-    # Deterministic order
     syms = sorted(set(syms))
     return syms[:MAX_SYMBOLS]
 
 def get_candles(product_id: str, granularity: int, limit_points: int) -> List[list]:
-    # Coinbase returns newest-first: [time, low, high, open, close, volume]
-    # We'll keep as provided and reverse later where needed.
-    # Note: API limit often ~300 points; we request only what we need.
     params = {"granularity": granularity}
     data = _http_get(f"{COINBASE_API}/products/{product_id}/candles", params=params)
     if not isinstance(data, list) or len(data) == 0:
         return []
-    # Ensure we only keep recent points
     return data[:limit_points]
 
 def get_last_price_from_candles(candles: List[list]) -> Optional[float]:
-    # candles: newest-first [t, low, high, open, close, vol]
     try:
         return float(candles[0][4])
     except Exception:
@@ -211,8 +206,7 @@ def ema_cross(closes: List[float]) -> Optional[Tuple[float, float]]:
 def _atr_percent(candles: List[list]) -> float:
     """ATR% using last ~30 candles, returned as percent of last close."""
     try:
-        # normalize to oldest->newest for ATR calc
-        recent = list(reversed(candles[:max(ATR_PERIOD + 2, 30)]))
+        recent = list(reversed(candles[:max(ATR_PERIOD + 2, 30)]))  # oldest->newest
         highs = [float(c[2]) for c in recent]
         lows = [float(c[1]) for c in recent]
         closes = [float(c[4]) for c in recent]
@@ -251,26 +245,20 @@ def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, Dic
 
     p0 = closes[-1]
 
-    # RVOL (last volume / avg of prior 20)
     avg_vol = float(np.mean(vols[-21:-1])) if len(vols) >= 22 else float(np.mean(vols[:-1]))
     rvol = (vols[-1] / avg_vol) if avg_vol > 0 else 1.0
 
-    # Acceleration: delta between last 5-candle return and previous 5-candle return
     ret_5 = (closes[-1] - closes[-6]) / closes[-6] if closes[-6] > 0 else 0.0
     ret_prev_5 = (closes[-6] - closes[-11]) / closes[-11] if closes[-11] > 0 else 0.0
     accel = ret_5 - ret_prev_5
 
-    # Extension filter: price above EMA20
     ema20 = float(_ema(np.array(closes, dtype=float), 20)[-1])
     ext = ((p0 - ema20) / ema20) if ema20 > 0 else 0.0
 
-    # ATR%
     atrp = _atr_percent(candles)
 
-    # Score
     score = 4
 
-    # RVOL engine
     if rvol >= 3.0:
         score += 4
     elif rvol >= MIN_VOLUME_RATIO:
@@ -278,15 +266,12 @@ def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, Dic
     elif rvol < 1.0:
         score -= 3
 
-    # Acceleration boost
     if accel > 0:
         score += 2
 
-    # Over-extension penalty
     if ext > EXTENSION_MAX:
         score -= 5
 
-    # Confluence (light)
     mp = macd_pack(closes)
     ep = ema_cross(closes)
     if mp and mp[2] > 0:
@@ -314,6 +299,11 @@ class Position:
     trail_dist_pct: float
     last_reason: str
     last_score: int
+    # store entry features for true ML training
+    entry_rvol: float
+    entry_accel: float
+    entry_ext: float
+    entry_atrp: float
 
 # =========================
 # PERSISTENCE (LOCAL)
@@ -335,7 +325,6 @@ def _safe_write_json(path: str, obj: Any):
 
 # =========================
 # OPTIONAL GITHUB PERSISTENCE
-# Uses GitHub Contents API
 # =========================
 def _gh_headers():
     return {
@@ -403,7 +392,6 @@ def append_ledger_row(row: list):
 # ML: FEATURES + TRAINING + GATING
 # =========================
 def make_features(extra: Dict[str, float], score: int) -> List[float]:
-    # Keep stable ordering and version
     return [
         float(score),
         float(extra.get("rvol", 1.0)),
@@ -429,7 +417,6 @@ def train_model(store: dict) -> Optional[RandomForestClassifier]:
     try:
         X = np.array([r["x"] for r in rows], dtype=float)
         y = np.array([r["y"] for r in rows], dtype=int)
-        # Basic RF, conservative
         clf = RandomForestClassifier(
             n_estimators=250,
             max_depth=6,
@@ -444,7 +431,6 @@ def train_model(store: dict) -> Optional[RandomForestClassifier]:
 def ml_should_allow_buy(clf: Optional[RandomForestClassifier], store: dict, x: List[float]) -> Tuple[bool, float]:
     if not ML_ENABLED:
         return True, 0.0
-    # Activate ML only after ML_MIN_TRADES
     rows = store.get("rows", [])
     if len(rows) < ML_MIN_TRADES or clf is None:
         return True, 0.0
@@ -460,17 +446,16 @@ def ml_should_allow_buy(clf: Optional[RandomForestClassifier], store: dict, x: L
 def default_state() -> dict:
     return {
         "cash": START_BALANCE,
-        "positions": {},  # symbol -> Position dict
+        "positions": {},
         "wins": 0,
         "losses": 0,
         "realized_pnl": 0.0,
         "last_status_ts": 0,
         "last_ml_ts": 0,
-        "cooldowns": {},  # symbol -> timestamp until
+        "cooldowns": {},
     }
 
 def load_state() -> dict:
-    # Prefer GitHub if configured; fallback local
     gh = github_load(GITHUB_STATE_PATH)
     if gh and isinstance(gh.get("data"), dict):
         return gh["data"]
@@ -512,18 +497,17 @@ def btc_guard_ok() -> Tuple[bool, str]:
         candles = get_candles(BTC_SYMBOL, CANDLE_GRANULARITY, min(points, 250))
         if not candles or len(candles) < 10:
             return True, "guard_no_data"
-        # newest-first -> build closes oldest->newest
         recent = list(reversed(candles))
         closes = [float(c[4]) for c in recent]
         if len(closes) < 5:
             return True, "guard_short"
         window = int((BTC_GUARD_WINDOW_MIN * 60) / CANDLE_GRANULARITY)
         window = max(2, min(window, len(closes) - 1))
-        now = closes[-1]
+        nowp = closes[-1]
         past = closes[-1 - window]
         if past <= 0:
             return True, "guard_past0"
-        drop_pct = ((now - past) / past) * 100.0
+        drop_pct = ((nowp - past) / past) * 100.0
         if drop_pct <= -abs(BTC_GUARD_DROP_PCT):
             return False, f"BTC_GUARD drop={drop_pct:.2f}%/{BTC_GUARD_WINDOW_MIN}m"
         return True, f"BTC_GUARD ok drop={drop_pct:.2f}%/{BTC_GUARD_WINDOW_MIN}m"
@@ -534,27 +518,43 @@ def btc_guard_ok() -> Tuple[bool, str]:
 # BUY/SELL (PAPER)
 # =========================
 def can_buy_symbol(state: dict, sym: str) -> bool:
-    # cooldown prevents instant re-buy after a sell
     cd = (state.get("cooldowns") or {}).get(sym)
     if cd and time.time() < float(cd):
         return False
     return True
+
+def record_trade(state: dict, sym: str, entry_price: float, exit_price: float, qty: float, pnl: float, score: int, reason: str):
+    # Update stats exactly like you requested
+    if pnl > 0:
+        state["wins"] = int(state.get("wins", 0) + 1)
+    else:
+        state["losses"] = int(state.get("losses", 0) + 1)
+    state["realized_pnl"] = float(state.get("realized_pnl", 0.0) + pnl)
+
+    cost = float(qty) * float(entry_price)
+    pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
+
+    ensure_ledger_header()
+    # equity_after will be computed by caller (we pass in later); keep placeholder if needed
+    append_ledger_row([
+        int(time.time()), sym, "SELL", f"{qty:.8f}", f"{exit_price:.8f}",
+        f"{pnl:.6f}", f"{pnl_pct:.3f}",
+        f"{state['cash']:.2f}", "",  # equity filled later by status tick (or you can compute before calling)
+        score, reason
+    ])
 
 def open_position(state: dict, positions: Dict[str, Position], sym: str, price: float, score: int, reason: str, extra: Dict[str, float]):
     cash = float(state["cash"])
     if cash < MIN_TRADE_SIZE:
         return
 
-    # fixed trade size: MIN_TRADE_SIZE (simple & predictable)
     trade_usd = min(MIN_TRADE_SIZE, cash)
     qty = trade_usd / price
 
     atrp = float(extra.get("atrp", 1.5))
-    # Adaptive trailing distance
     trail_dist = max(float(TRAILING_DISTANCE_PERCENT), atrp * float(ATR_MULT))
     trail_dist = max(0.4, min(8.0, trail_dist))
 
-    # Hard stop
     stop_price = price * (1.0 - STOP_LOSS_PERCENT / 100.0)
 
     positions[sym] = Position(
@@ -568,14 +568,16 @@ def open_position(state: dict, positions: Dict[str, Position], sym: str, price: 
         trail_dist_pct=float(trail_dist),
         last_reason=reason,
         last_score=int(score),
+        entry_rvol=float(extra.get("rvol", 1.0)),
+        entry_accel=float(extra.get("accel", 0.0)),
+        entry_ext=float(extra.get("ext", 0.0)),
+        entry_atrp=float(extra.get("atrp", 1.5)),
     )
 
     state["cash"] = float(cash - trade_usd)
 
     ensure_ledger_header()
-    # pnl fields are 0 at buy
-    last_prices = {sym: price}
-    eq = equity(float(state["cash"]), positions, last_prices)
+    eq = equity(float(state["cash"]), positions, {sym: price})
     append_ledger_row([
         int(time.time()), sym, "BUY", f"{qty:.8f}", f"{price:.8f}",
         "0", "0",
@@ -589,50 +591,36 @@ def close_position(state: dict, positions: Dict[str, Position], sym: str, price:
     p = positions.get(sym)
     if not p:
         return
-    cash = float(state["cash"])
+
     proceeds = float(p.qty) * float(price)
     cost = float(p.qty) * float(p.entry_price)
     pnl = proceeds - cost
-    pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
 
-    state["cash"] = float(cash + proceeds)
-    state["realized_pnl"] = float(state.get("realized_pnl", 0.0) + pnl)
+    # credit cash first (important)
+    state["cash"] = float(state["cash"] + proceeds)
 
-    if pnl >= 0:
-        state["wins"] = int(state.get("wins", 0) + 1)
-    else:
-        state["losses"] = int(state.get("losses", 0) + 1)
+    # record + stats (your requested behavior)
+    record_trade(state, sym, p.entry_price, price, p.qty, pnl, int(p.last_score), reason)
 
     # cooldown so it doesn't rebuy immediately
     cds = state.get("cooldowns") or {}
     cds[sym] = float(time.time() + COOLDOWN_SECONDS_AFTER_SELL)
     state["cooldowns"] = cds
 
-    ensure_ledger_header()
-    last_prices = {sym: price}
-    eq = equity(float(state["cash"]), {k:v for k,v in positions.items() if k != sym}, last_prices)
-    append_ledger_row([
-        int(time.time()), sym, "SELL", f"{p.qty:.8f}", f"{price:.8f}",
-        f"{pnl:.6f}", f"{pnl_pct:.3f}",
-        f"{state['cash']:.2f}", f"{eq:.2f}",
-        p.last_score, reason
-    ])
-
     del positions[sym]
+
+    pnl_pct = (pnl / cost) * 100.0 if cost > 0 else 0.0
     notify(f"🔴 SELL {sym} @ {price:.6f} | PnL=${pnl:.2f} ({pnl_pct:.2f}%) | {reason}")
 
-    # ML training row on trade close
+    # ML training row (now with true entry features)
     if ML_ENABLED:
         store = load_ml_store()
         y = 1 if pnl > 0 else 0
         x = make_features(
-            extra={"rvol": 0, "accel": 0, "ext": 0, "atrp": p.trail_dist_pct / max(ATR_MULT, 1e-9)},
+            extra={"rvol": p.entry_rvol, "accel": p.entry_accel, "ext": p.entry_ext, "atrp": p.entry_atrp},
             score=int(p.last_score),
         )
-        # We can't reconstruct exact entry extras unless you store them; so we store a stable approximation.
-        # If you want exact entry features, we can store them directly on Position too.
         store["rows"].append({"x": x, "y": y, "t": int(time.time())})
-        # Cap store size
         if len(store["rows"]) > 2000:
             store["rows"] = store["rows"][-2000:]
         save_ml_store(store)
@@ -646,29 +634,21 @@ def manage_positions(state: dict, positions: Dict[str, Position], last_prices: D
         if px is None:
             continue
 
-        # Update high water
         if px > p.high_water:
             p.high_water = float(px)
 
-        # Hard stop loss
         hard_stop = p.entry_price * (1.0 - STOP_LOSS_PERCENT / 100.0)
         if px <= hard_stop:
             close_position(state, positions, sym, px, f"STOP_LOSS {STOP_LOSS_PERCENT:.2f}%")
             continue
 
-        # Activate trailing after minimal profit
         profit_pct = ((px - p.entry_price) / p.entry_price) * 100.0 if p.entry_price > 0 else 0.0
         if (not p.trailing_active) and profit_pct >= TRAILING_START_PERCENT:
             p.trailing_active = True
 
-        # Trailing logic if active:
         if p.trailing_active:
-            # Adaptive trail distance already stored in p.trail_dist_pct
             trail_stop = p.high_water * (1.0 - p.trail_dist_pct / 100.0)
-            # Never worse than hard stop:
             trail_stop = max(trail_stop, hard_stop)
-
-            # Price dips below trailing stop => sell
             if px <= trail_stop:
                 close_position(state, positions, sym, px, f"TRAIL_STOP {p.trail_dist_pct:.2f}% from high")
                 continue
@@ -719,18 +699,17 @@ def main():
     positions = positions_from_state(state)
     ensure_ledger_header()
 
-    # Load ML store, build model periodically
     ml_store = load_ml_store()
     ml_active = bool(ml_store.get("ml_active", False))
     model = None
 
-    # If user specified COINS, use them; else discover products
-    if COINS:
-        universe = [s.strip() for s in COINS.split(",") if s.strip()]
-    else:
+    # ✅ FIX: COINS="AUTO" (or blank) should NOT become a symbol
+    coins_clean = (COINS or "").strip()
+    if (not coins_clean) or (coins_clean.upper() == "AUTO"):
         universe = list_usd_products()
+    else:
+        universe = [s.strip() for s in coins_clean.split(",") if s.strip()]
 
-    # Apply EXCLUDE
     universe = [s for s in universe if s not in EXCLUDE]
     universe = universe[:MAX_SYMBOLS]
 
@@ -739,13 +718,11 @@ def main():
 
     while True:
         try:
-            # Market guard
             guard_ok, guard_msg = btc_guard_ok()
 
-            # Pull candles and prices for universe (lightweight: reuse candles for scoring + price)
             last_prices: Dict[str, float] = {}
 
-            # Update open positions prices first (so exits are responsive)
+            # Update open positions prices first
             for sym in list(positions.keys()):
                 candles = get_candles(sym, CANDLE_GRANULARITY, min(CANDLE_POINTS, 200))
                 px = get_last_price_from_candles(candles)
@@ -755,7 +732,11 @@ def main():
             # Manage exits
             manage_positions(state, positions, last_prices)
 
-            # Entries only if guard is OK
+            # Save immediately after exits (so "recording" is never delayed)
+            state["positions"] = positions_to_state(positions)
+            save_state(state)
+
+            # Entries only if guard OK
             new_buys = 0
             if guard_ok and len(positions) < MAX_OPEN_TRADES:
                 candidates = []
@@ -777,19 +758,15 @@ def main():
                     if score is None:
                         continue
 
-                    # Hard RVOL gate (keeps it sniper)
                     if float(extra.get("rvol", 1.0)) < MIN_VOLUME_RATIO:
                         continue
-
-                    # Score gate
                     if int(score) < ENTRY_SCORE_MIN:
                         continue
 
-                    # ML gate (if active enough)
                     x = make_features(extra, int(score))
                     allow, prob = ml_should_allow_buy(model, ml_store, x)
+
                     if (model is not None) and (len(ml_store.get("rows", [])) >= ML_MIN_TRADES):
-                        # If model exists, it is effectively active
                         if not ml_active:
                             ml_active = True
                             ml_store["ml_active"] = True
@@ -799,10 +776,8 @@ def main():
                     if not allow:
                         continue
 
-                    # Candidate: higher score first, then higher RVOL
                     candidates.append((int(score), float(extra.get("rvol", 1.0)), sym, px, reason, extra, prob))
 
-                # Sort candidates (best first)
                 candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
                 for sc, rv, sym, px, reason, extra, prob in candidates:
@@ -813,29 +788,31 @@ def main():
                     if float(state["cash"]) < MIN_TRADE_SIZE:
                         break
 
-                    # Include prob in reason if ML is active
-                    if prob and prob > 0:
-                        reason2 = f"{reason} MLp={prob:.2f}"
-                    else:
-                        reason2 = reason
+                    reason2 = f"{reason} MLp={prob:.2f}" if (prob and prob > 0) else reason
 
                     open_position(state, positions, sym, px, sc, reason2, extra)
+
+                    # Save immediately after each BUY
+                    state["positions"] = positions_to_state(positions)
+                    save_state(state)
+
                     new_buys += 1
 
-            # Periodic ML training
             now = time.time()
+
+            # Periodic ML training
             if ML_ENABLED and (now - last_ml) >= ML_INTERVAL:
                 ml_store = load_ml_store()
                 model = train_model(ml_store)
                 last_ml = now
                 state["last_ml_ts"] = int(last_ml)
-                save_state({**state, "positions": positions_to_state(positions)})
+                state["positions"] = positions_to_state(positions)
+                save_state(state)
 
             # Periodic status
             if (now - last_status) >= STATUS_INTERVAL:
                 last_status = now
                 state["last_status_ts"] = int(last_status)
-                # Save state every status tick
                 state["positions"] = positions_to_state(positions)
                 save_state(state)
                 status_report(state, positions, last_prices, guard_msg, ml_active)
@@ -846,7 +823,6 @@ def main():
             raise
         except Exception as e:
             notify(f"⚠️ ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-            # Don't spin too fast
             time.sleep(3)
 
 if __name__ == "__main__":
