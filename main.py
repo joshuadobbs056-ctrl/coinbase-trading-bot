@@ -632,8 +632,13 @@ def score_symbol(sym: str, candles):
     macd, sig, hist, diff_now, diff_prev, hist_prev = mp
     ema_now, ema_prev = ep
 
-    macd_cross_up = (diff_prev <= 0.0 and diff_now > 0.0)
-    golden_cross = ((ema_prev <= 0.0 and ema_now > 0.0) or (ema_now > 0.0))
+   macd_cross_up = (diff_prev <= 0.0 and diff_now > 0.0)
+
+# REQUIRE MACD CROSS BEFORE BUYING
+if not macd_cross_up:
+    return None, "NO_MACD_CROSS"
+
+golden_cross = ((ema_prev <= 0.0 and ema_now > 0.0) or (ema_now > 0.0))
 
     vratio = volume_ratio(candles)
 
