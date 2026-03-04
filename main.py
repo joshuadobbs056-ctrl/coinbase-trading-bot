@@ -668,11 +668,6 @@ golden_cross = ((ema_prev <= 0.0 and ema_now > 0.0) or (ema_now > 0.0))
 
     # Anticipated MACD "pre-cross" entry
     try:
-        # diff_now < 0 => not crossed yet, but rising toward 0 + hist improving
-        if diff_now < 0 and diff_now > diff_prev and hist > hist_prev and abs(diff_now) <= MACD_PRE_CROSS_MAX:
-            score += float(MACD_PRE_CROSS_BONUS)
-    except Exception:
-        pass
 
     # Accumulation bonus (sideways + rising volume)
     score += float(accumulation_bonus(candles))
