@@ -5,7 +5,7 @@ import requests
 import ccxt
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # =========================
 # SINGLE INSTANCE LOCK
@@ -86,8 +86,7 @@ exchange = ccxt.coinbasepro({
 
 def get_all_usd_symbols():
     markets = exchange.load_markets()
-    symbols = [s for s in markets if s.endswith("-USD")]
-    return symbols
+    return [s for s in markets if s.endswith("-USD")]
 
 SYMBOLS = get_all_usd_symbols()
 print(f"Scanning {len(SYMBOLS)} USD tokens")
@@ -111,9 +110,9 @@ def _fetch_candles(symbol):
         print(f"fetch_candles error {symbol}:", e)
         return []
 
-def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, dict]:
+def score_symbol(sym: str, candles: List[list]) -> Tuple[int, str, dict]:
     if not candles:
-        return None, "no_data", {}
+        return 0, "no_data", {}
     closes = np.array([c[4] for c in candles])
     vols = np.array([c[5] for c in candles])
 
@@ -162,8 +161,11 @@ def close_position(state, positions, sym, price):
 def manage_positions(state, positions):
     to_close = []
     for sym, p in positions.items():
-        ticker = exchange.fetch_ticker(sym)
-        last = ticker["last"]
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            last = ticker["last"]
+        except:
+            continue
         if last <= p.stop_price:
             to_close.append((sym, last))
         elif last > p.high_water * (1 + TRAILING_START_PERCENT / 100):
@@ -184,8 +186,11 @@ def manage_positions(state, positions):
 def status_report(state, positions):
     equity = state["cash"]
     for s, p in positions.items():
-        ticker = exchange.fetch_ticker(s)
-        equity += p.qty * ticker["last"]
+        try:
+            ticker = exchange.fetch_ticker(s)
+            equity += p.qty * ticker["last"]
+        except:
+            continue
     notify(f"📊 STATUS | Cash:${state['cash']:.2f} | Open:{len(positions)} | Equity:${equity:.2f}")
 
 # =========================
@@ -198,21 +203,25 @@ def main():
 
     notify("🚀 Savage ELITE Paper Trading Initialized")
 
+    batch_size = 10
     while True:
         try:
             manage_positions(state, positions)
 
-            for sym in SYMBOLS:
-                if len(positions) >= MAX_OPEN_TRADES:
-                    break
-                if sym in positions:
-                    continue
-
-                candles = _fetch_candles(sym)
-                score, reason, extra = score_symbol(sym, candles)
-                if score and score >= ENTRY_SCORE_MIN:
-                    price = candles[-1][4]
-                    open_position(state, positions, sym, price)
+            # Scan symbols in batches to avoid rate limits
+            for i in range(0, len(SYMBOLS), batch_size):
+                batch = SYMBOLS[i:i + batch_size]
+                for sym in batch:
+                    if len(positions) >= MAX_OPEN_TRADES:
+                        break
+                    if sym in positions:
+                        continue
+                    candles = _fetch_candles(sym)
+                    score, reason, extra = score_symbol(sym, candles)
+                    if score >= ENTRY_SCORE_MIN:
+                        price = candles[-1][4]
+                        open_position(state, positions, sym, price)
+                    time.sleep(0.25)  # throttle API calls
 
             if time.time() - last_status > STATUS_INTERVAL:
                 status_report(state, positions)
