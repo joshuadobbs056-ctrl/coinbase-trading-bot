@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import traceback
 import requests
 import ccxt
@@ -201,10 +200,8 @@ def main():
 
     while True:
         try:
-            # 1️⃣ Manage open positions
             manage_positions(state, positions)
 
-            # 2️⃣ Scan new entries
             for sym in SYMBOLS:
                 if len(positions) >= MAX_OPEN_TRADES:
                     break
@@ -217,7 +214,6 @@ def main():
                     price = candles[-1][4]
                     open_position(state, positions, sym, price)
 
-            # 3️⃣ Periodic status
             if time.time() - last_status > STATUS_INTERVAL:
                 status_report(state, positions)
                 last_status = time.time()
