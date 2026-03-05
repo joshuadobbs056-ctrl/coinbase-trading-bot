@@ -1,10 +1,12 @@
 import os
 import time
+import json
 import traceback
 import requests
+import ccxt
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # =========================
 # SINGLE INSTANCE LOCK
@@ -31,27 +33,22 @@ def acquire_lock_or_exit():
 acquire_lock_or_exit()
 
 # =========================
-# CORE CONFIGURATION
+# CONFIGURATION
 # =========================
-START_BALANCE = 2000  # Updated ledger
+START_BALANCE = 2000
 SCAN_INTERVAL = 6
 STATUS_INTERVAL = 300
-
 MAX_OPEN_TRADES = 6
 MIN_TRADE_SIZE = 50
-
 STOP_LOSS_PERCENT = 3.5
 TRAILING_START_PERCENT = 1.0
 TRAILING_DISTANCE_PERCENT = 1.2
-
 ENTRY_SCORE_MIN = 8
 MIN_VOLUME_RATIO = 3.5
 EXTENSION_MAX = 0.04
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "MATIC-USD"]
 
 # =========================
 # TELEGRAM NOTIFY
@@ -82,30 +79,19 @@ class Position:
     trailing_active: bool
 
 # =========================
-# PAPER EXCHANGE SIMULATION
+# EXCHANGE SETUP
 # =========================
-class PaperExchange:
-    def __init__(self, symbols):
-        self.symbols = symbols
-        self.prices = {s: 100 for s in symbols}  # start all symbols at $100
+exchange = ccxt.coinbasepro({
+    "enableRateLimit": True,
+})
 
-    def fetch_ohlcv(self, symbol, timeframe="5m", limit=200):
-        data = []
-        price = self.prices[symbol]
-        for _ in range(limit):
-            o = price
-            h = o * (1 + np.random.uniform(0, 0.002))
-            l = o * (1 - np.random.uniform(0, 0.002))
-            c = np.random.uniform(l, h)
-            v = np.random.uniform(50, 200)
-            data.append([int(time.time()), o, h, l, c, v])
-        self.prices[symbol] = data[-1][4]
-        return data
+def get_all_usd_symbols():
+    markets = exchange.load_markets()
+    symbols = [s for s in markets if s.endswith("-USD")]
+    return symbols
 
-    def fetch_ticker(self, symbol):
-        return {"last": self.prices[symbol]}
-
-exchange = PaperExchange(SYMBOLS)
+SYMBOLS = get_all_usd_symbols()
+print(f"Scanning {len(SYMBOLS)} tokens")
 
 # =========================
 # INDICATORS
@@ -120,14 +106,15 @@ def _ema(values, n):
 
 def _fetch_candles(symbol):
     try:
-        return exchange.fetch_ohlcv(symbol, timeframe="5m", limit=200)
+        data = exchange.fetch_ohlcv(symbol, timeframe="5m", limit=200)
+        return data
     except Exception as e:
         print(f"fetch_candles error {symbol}:", e)
         return []
 
-def score_symbol(sym: str, candles: List[list]) -> Tuple[int, str, dict]:
+def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, dict]:
     if not candles:
-        return 0, "no_data", {}
+        return None, "no_data", {}
     closes = np.array([c[4] for c in candles])
     vols = np.array([c[5] for c in candles])
 
@@ -193,7 +180,7 @@ def manage_positions(state, positions):
         close_position(state, positions, sym, price)
 
 # =========================
-# STATUS REPORT
+# REPORTING
 # =========================
 def status_report(state, positions):
     equity = state["cash"]
@@ -210,12 +197,14 @@ def main():
     positions: Dict[str, Position] = {}
     last_status = time.time()
 
-    notify("🚀 Savage ELITE Paper Trading Engine Initialized")
+    notify("🚀 Savage ELITE Paper Trading Initialized")
 
     while True:
         try:
+            # 1️⃣ Manage open positions
             manage_positions(state, positions)
 
+            # 2️⃣ Scan new entries
             for sym in SYMBOLS:
                 if len(positions) >= MAX_OPEN_TRADES:
                     break
@@ -228,6 +217,7 @@ def main():
                     price = candles[-1][4]
                     open_position(state, positions, sym, price)
 
+            # 3️⃣ Periodic status
             if time.time() - last_status > STATUS_INTERVAL:
                 status_report(state, positions)
                 last_status = time.time()
