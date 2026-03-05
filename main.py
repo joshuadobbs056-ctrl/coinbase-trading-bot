@@ -35,8 +35,8 @@ acquire_lock_or_exit()
 # CONFIGURATION
 # =========================
 START_BALANCE = 2000
-SCAN_INTERVAL = 6
-STATUS_INTERVAL = 300
+SCAN_INTERVAL = 6          # seconds
+STATUS_INTERVAL = 300      # seconds
 MAX_OPEN_TRADES = 6
 MIN_TRADE_SIZE = 50
 STOP_LOSS_PERCENT = 3.5
@@ -90,7 +90,7 @@ def get_all_usd_symbols():
     return symbols
 
 SYMBOLS = get_all_usd_symbols()
-print(f"Scanning {len(SYMBOLS)} tokens")
+print(f"Scanning {len(SYMBOLS)} USD tokens")
 
 # =========================
 # INDICATORS
@@ -179,7 +179,7 @@ def manage_positions(state, positions):
         close_position(state, positions, sym, price)
 
 # =========================
-# REPORTING
+# STATUS REPORT
 # =========================
 def status_report(state, positions):
     equity = state["cash"]
