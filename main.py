@@ -35,7 +35,7 @@ acquire_lock_or_exit()
 # =========================
 # CORE CONFIGURATION
 # =========================
-START_BALANCE = 2000
+START_BALANCE = 2000.0
 SCAN_INTERVAL = 6
 STATUS_INTERVAL = 300
 
@@ -53,11 +53,12 @@ EXTENSION_MAX = 0.04
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-COINBASE_PRO_API_KEY = os.getenv("COINBASE_PRO_API_KEY")
-COINBASE_PRO_API_SECRET = os.getenv("COINBASE_PRO_API_SECRET")
-COINBASE_PRO_API_PASSWORD = os.getenv("COINBASE_PRO_API_PASSWORD")
+COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
+COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
+COINBASE_API_PASSWORD = os.getenv("COINBASE_API_PASSWORD")
 
-SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "MATIC/USD"]
+# Use Coinbase Exchange symbol format
+SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "MATIC-USD"]
 
 # =========================
 # TELEGRAM NOTIFY
@@ -88,12 +89,12 @@ class Position:
     trailing_active: bool
 
 # =========================
-# EXCHANGE SETUP (Coinbase Pro)
+# EXCHANGE SETUP
 # =========================
-exchange = ccxt.coinbasepro({
-    "apiKey": COINBASE_PRO_API_KEY,
-    "secret": COINBASE_PRO_API_SECRET,
-    "password": COINBASE_PRO_API_PASSWORD,
+exchange = ccxt.coinbase({
+    "apiKey": COINBASE_API_KEY,
+    "secret": COINBASE_API_SECRET,
+    "password": COINBASE_API_PASSWORD,
     "enableRateLimit": True,
 })
 
@@ -110,6 +111,7 @@ def _ema(values, n):
 
 def _fetch_candles(symbol):
     try:
+        # Coinbase Exchange / Advanced Trade endpoint via ccxt
         data = exchange.fetch_ohlcv(symbol, timeframe="5m", limit=200)
         return data
     except Exception as e:
@@ -140,7 +142,7 @@ def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, dic
     return int(max(1, min(10, score))), f"RVOL:{rvol:.2f} EXT:{ext:.3f}", {"rvol": rvol, "ext": ext}
 
 # =========================
-# TRADE LOGIC (Paper Trading)
+# TRADE LOGIC
 # =========================
 def open_position(state, positions, sym, price):
     if state["cash"] < MIN_TRADE_SIZE:
@@ -155,25 +157,20 @@ def open_position(state, positions, sym, price):
         stop_price=price * (1 - STOP_LOSS_PERCENT / 100),
         trailing_active=False,
     )
-    notify(f"🟢 PAPER BUY {sym} @ ${price:.2f}")
+    notify(f"🟢 BUY {sym} @ ${price:.2f}")
 
 def close_position(state, positions, sym, price):
     p = positions.pop(sym)
     proceeds = p.qty * price
     pnl = proceeds - (p.qty * p.entry_price)
     state["cash"] += proceeds
-    notify(f"🔴 PAPER SELL {sym} @ ${price:.2f} | PnL: ${pnl:.2f}")
+    notify(f"🔴 SELL {sym} @ ${price:.2f} | PnL: ${pnl:.2f}")
 
 def manage_positions(state, positions):
     to_close = []
     for sym, p in positions.items():
-        try:
-            ticker = exchange.fetch_ticker(sym)
-            last = ticker["last"]
-        except Exception as e:
-            print(f"fetch_ticker error {sym}:", e)
-            continue
-
+        ticker = exchange.fetch_ticker(sym)
+        last = ticker["last"]
         if last <= p.stop_price:
             to_close.append((sym, last))
         elif last > p.high_water * (1 + TRAILING_START_PERCENT / 100):
@@ -194,11 +191,8 @@ def manage_positions(state, positions):
 def status_report(state, positions):
     equity = state["cash"]
     for s, p in positions.items():
-        try:
-            ticker = exchange.fetch_ticker(s)
-            equity += p.qty * ticker["last"]
-        except Exception:
-            equity += p.qty * p.entry_price
+        ticker = exchange.fetch_ticker(s)
+        equity += p.qty * ticker["last"]
     notify(f"📊 STATUS | Cash:${state['cash']:.2f} | Open:{len(positions)} | Equity:${equity:.2f}")
 
 # =========================
@@ -209,7 +203,7 @@ def main():
     positions: Dict[str, Position] = {}
     last_status = time.time()
 
-    notify("🚀 Savage ELITE Paper Trading Engine Initialized ($2000 Ledger)")
+    notify("🚀 Savage ELITE Engine Initialized")
 
     while True:
         try:
