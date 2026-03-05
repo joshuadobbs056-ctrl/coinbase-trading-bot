@@ -1,11 +1,12 @@
 import os
 import time
+import json
 import traceback
 import requests
 import ccxt
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # =========================
 # SINGLE INSTANCE LOCK
@@ -32,22 +33,31 @@ def acquire_lock_or_exit():
 acquire_lock_or_exit()
 
 # =========================
-# CONFIGURATION
+# CORE CONFIGURATION
 # =========================
 START_BALANCE = 2000
-SCAN_INTERVAL = 6          # seconds
-STATUS_INTERVAL = 300      # seconds
+SCAN_INTERVAL = 6
+STATUS_INTERVAL = 300
+
 MAX_OPEN_TRADES = 6
 MIN_TRADE_SIZE = 50
+
 STOP_LOSS_PERCENT = 3.5
 TRAILING_START_PERCENT = 1.0
 TRAILING_DISTANCE_PERCENT = 1.2
+
 ENTRY_SCORE_MIN = 8
 MIN_VOLUME_RATIO = 3.5
 EXTENSION_MAX = 0.04
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+COINBASE_PRO_API_KEY = os.getenv("COINBASE_PRO_API_KEY")
+COINBASE_PRO_API_SECRET = os.getenv("COINBASE_PRO_API_SECRET")
+COINBASE_PRO_API_PASSWORD = os.getenv("COINBASE_PRO_API_PASSWORD")
+
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "MATIC/USD"]
 
 # =========================
 # TELEGRAM NOTIFY
@@ -78,18 +88,14 @@ class Position:
     trailing_active: bool
 
 # =========================
-# EXCHANGE SETUP
+# EXCHANGE SETUP (Coinbase Pro)
 # =========================
 exchange = ccxt.coinbasepro({
+    "apiKey": COINBASE_PRO_API_KEY,
+    "secret": COINBASE_PRO_API_SECRET,
+    "password": COINBASE_PRO_API_PASSWORD,
     "enableRateLimit": True,
 })
-
-def get_all_usd_symbols():
-    markets = exchange.load_markets()
-    return [s for s in markets if s.endswith("-USD")]
-
-SYMBOLS = get_all_usd_symbols()
-print(f"Scanning {len(SYMBOLS)} USD tokens")
 
 # =========================
 # INDICATORS
@@ -110,9 +116,9 @@ def _fetch_candles(symbol):
         print(f"fetch_candles error {symbol}:", e)
         return []
 
-def score_symbol(sym: str, candles: List[list]) -> Tuple[int, str, dict]:
+def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, dict]:
     if not candles:
-        return 0, "no_data", {}
+        return None, "no_data", {}
     closes = np.array([c[4] for c in candles])
     vols = np.array([c[5] for c in candles])
 
@@ -134,7 +140,7 @@ def score_symbol(sym: str, candles: List[list]) -> Tuple[int, str, dict]:
     return int(max(1, min(10, score))), f"RVOL:{rvol:.2f} EXT:{ext:.3f}", {"rvol": rvol, "ext": ext}
 
 # =========================
-# TRADE LOGIC
+# TRADE LOGIC (Paper Trading)
 # =========================
 def open_position(state, positions, sym, price):
     if state["cash"] < MIN_TRADE_SIZE:
@@ -149,14 +155,14 @@ def open_position(state, positions, sym, price):
         stop_price=price * (1 - STOP_LOSS_PERCENT / 100),
         trailing_active=False,
     )
-    notify(f"🟢 BUY {sym} @ ${price:.2f}")
+    notify(f"🟢 PAPER BUY {sym} @ ${price:.2f}")
 
 def close_position(state, positions, sym, price):
     p = positions.pop(sym)
     proceeds = p.qty * price
     pnl = proceeds - (p.qty * p.entry_price)
     state["cash"] += proceeds
-    notify(f"🔴 SELL {sym} @ ${price:.2f} | PnL: ${pnl:.2f}")
+    notify(f"🔴 PAPER SELL {sym} @ ${price:.2f} | PnL: ${pnl:.2f}")
 
 def manage_positions(state, positions):
     to_close = []
@@ -164,8 +170,10 @@ def manage_positions(state, positions):
         try:
             ticker = exchange.fetch_ticker(sym)
             last = ticker["last"]
-        except:
+        except Exception as e:
+            print(f"fetch_ticker error {sym}:", e)
             continue
+
         if last <= p.stop_price:
             to_close.append((sym, last))
         elif last > p.high_water * (1 + TRAILING_START_PERCENT / 100):
@@ -181,7 +189,7 @@ def manage_positions(state, positions):
         close_position(state, positions, sym, price)
 
 # =========================
-# STATUS REPORT
+# REPORTING
 # =========================
 def status_report(state, positions):
     equity = state["cash"]
@@ -189,8 +197,8 @@ def status_report(state, positions):
         try:
             ticker = exchange.fetch_ticker(s)
             equity += p.qty * ticker["last"]
-        except:
-            continue
+        except Exception:
+            equity += p.qty * p.entry_price
     notify(f"📊 STATUS | Cash:${state['cash']:.2f} | Open:{len(positions)} | Equity:${equity:.2f}")
 
 # =========================
@@ -201,28 +209,27 @@ def main():
     positions: Dict[str, Position] = {}
     last_status = time.time()
 
-    notify("🚀 Savage ELITE Paper Trading Initialized")
+    notify("🚀 Savage ELITE Paper Trading Engine Initialized ($2000 Ledger)")
 
-    batch_size = 10
     while True:
         try:
+            # 1️⃣ Manage open positions
             manage_positions(state, positions)
 
-            # Scan symbols in batches to avoid rate limits
-            for i in range(0, len(SYMBOLS), batch_size):
-                batch = SYMBOLS[i:i + batch_size]
-                for sym in batch:
-                    if len(positions) >= MAX_OPEN_TRADES:
-                        break
-                    if sym in positions:
-                        continue
-                    candles = _fetch_candles(sym)
-                    score, reason, extra = score_symbol(sym, candles)
-                    if score >= ENTRY_SCORE_MIN:
-                        price = candles[-1][4]
-                        open_position(state, positions, sym, price)
-                    time.sleep(0.25)  # throttle API calls
+            # 2️⃣ Scan new entries
+            for sym in SYMBOLS:
+                if len(positions) >= MAX_OPEN_TRADES:
+                    break
+                if sym in positions:
+                    continue
 
+                candles = _fetch_candles(sym)
+                score, reason, extra = score_symbol(sym, candles)
+                if score and score >= ENTRY_SCORE_MIN:
+                    price = candles[-1][4]
+                    open_position(state, positions, sym, price)
+
+            # 3️⃣ Periodic status
             if time.time() - last_status > STATUS_INTERVAL:
                 status_report(state, positions)
                 last_status = time.time()
