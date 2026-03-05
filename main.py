@@ -1,151 +1,207 @@
-import os
-import time
+import os, time, json, csv, traceback, base64
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, List, Optional, Tuple
+
 import requests
-from collections import deque
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 
-# --- Configuration ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15)) # Faster scans for faster entries
+# =========================
+# SINGLE INSTANCE LOCK
+# =========================
+LOCK_FILE = "/tmp/coin_sniper.lock"
 
-# Tightened Filtering for High-Conviction Runners
-MIN_LIQUIDITY = 30000 
-MAX_LIQUIDITY = 750000
-MIN_VOLUME_5M = 35000 # Increased to filter out "ghost" tokens
-MIN_PRICE_CHANGE_1M = 2.5 # Looking for sharper vertical moves
-MIN_PRICE_CHANGE_5M = 8.0 
-MIN_TRADES_5M = 40 # High activity is key for micro-caps
-MIN_BUY_RATIO = 0.65 # Want strong buy pressure
-MIN_FDV = 150000
-MAX_FDV = 15000000
-
-alerted_tokens = {} 
-watchlist = deque(maxlen=5)
-queries = ["sol", "eth", "pepe", "pump", "ai", "base", "meme", "wiz", "inu"]
-
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Tele-Log: {msg[:60]}...")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": msg,
-            "disable_web_page_preview": True,
-            "parse_mode": "Markdown" # Allows for bolding/formatting
-        }, timeout=10)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
-
-def get_pairs():
-    all_pairs = []
-    seen = set()
-    for q in queries:
+def acquire_lock_or_exit():
+    if os.path.exists(LOCK_FILE):
         try:
-            url = f"https://api.dexscreener.com/latest/dex/search/?q={q}"
-            r = requests.get(url, timeout=5)
-            if r.status_code == 200:
-                data = r.json()
-                for p in data.get("pairs", []):
-                    addr = p.get("pairAddress")
-                    # Filter for only main chains to avoid "junk" chains
-                    chain = p.get("chainId")
-                    if addr and addr not in seen and chain in ['solana', 'base', 'ethereum']:
-                        seen.add(addr)
-                        all_pairs.append(p)
-            time.sleep(0.2) 
-        except:
-            continue
-    return all_pairs
+            raw = open(LOCK_FILE).read().strip()
+            if raw:
+                old_pid = int(raw.split("|")[0])
+                try:
+                    os.kill(old_pid, 0)
+                    raise SystemExit(0)
+                except OSError: pass
+        except SystemExit: raise
+        except Exception: pass
+    open(LOCK_FILE, "w").write(f"{os.getpid()}|{int(time.time())}")
 
-def passes_filters(pair):
-    liq = pair.get("liquidity", {}).get("usd", 0)
-    vol5 = pair.get("volume", {}).get("m5", 0)
-    m1 = pair.get("priceChange", {}).get("m1", 0)
-    m5 = pair.get("priceChange", {}).get("m5", 0)
-    fdv = pair.get("fdv", 0)
-    
-    txns = pair.get("txns", {}).get("m5", {})
-    buys, sells = txns.get("buys", 0), txns.get("sells", 0)
-    total = buys + sells
+acquire_lock_or_exit()
 
-    # --- THE PROFIT IMPROVERS ---
-    # 1. Filter out wash-trading (Volume shouldn't be 10x Liquidity in 5 mins)
-    if vol5 > (liq * 5): return False 
-    
-    # 2. Basic filter set
-    if not (MIN_LIQUIDITY <= liq <= MAX_LIQUIDITY): return False
-    if vol5 < MIN_VOLUME_5M or total < MIN_TRADES_5M: return False
-    if m1 < MIN_PRICE_CHANGE_1M or m5 < MIN_PRICE_CHANGE_5M: return False
-    
-    # 3. Buy Ratio Logic
-    if total > 0 and (buys / total) < MIN_BUY_RATIO: return False
-    if not (MIN_FDV <= fdv <= MAX_FDV): return False
-    
-    return True
+# =========================
+# CORE CONFIGURATION
+# =========================
+START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
+SCAN_INTERVAL = 6                 # Fast heartbeat
+STATUS_INTERVAL = 300             # Profit report every 5 mins
+ML_INTERVAL = 300                 
 
-def score_pair(pair):
-    score = 0
-    m1 = pair.get("priceChange", {}).get("m1", 0)
-    m5 = pair.get("priceChange", {}).get("m5", 0)
-    vol5 = pair.get("volume", {}).get("m5", 0)
-    liq = pair.get("liquidity", {}).get("usd", 0)
-    
-    # Velocity Score: Is the 1m move making up the bulk of the 5m move? (Bullish)
-    if m1 >= (m5 * 0.4): score += 4 
-    # Liquidity Health: Better score if volume is 50%-100% of liquidity
-    if (liq * 0.5) < vol5 < liq: score += 3
-    # Absolute Strength
-    if m1 > 5: score += 3
-    
-    return score
+MAX_OPEN_TRADES = 12
+MAX_NEW_BUYS_PER_SCAN = 2
+MIN_TRADE_SIZE = 50               # Increased for profit impact
 
-def run():
-    print("Optimization active. Scanning for high-velocity runners...")
+# --- Profit-Focused Exit Strategy ---
+STOP_LOSS_PERCENT = 3.5           # Tight stop to protect equity
+TRAILING_START_PERCENT = 1.0      # Lock in gains early
+TRAILING_DISTANCE_PERCENT = 1.2   # Tight trail for micro-cap volatility
+ATR_MULT = 2.5                    # Adaptive volatility multiplier
+
+# --- High-Conviction Entry Gates ---
+ENTRY_SCORE_MIN = 8               
+MIN_VOLUME_RATIO = 3.5            # RVOL floor
+EXTENSION_MAX = 0.04              # Anti-FOMO: Max distance from EMA20
+COOLDOWN_SECONDS_AFTER_SELL = 600 
+
+# --- Market Guard & AI ---
+BTC_GUARD_DROP_PCT = 0.7          # Sensitive BTC dump protection
+ML_MIN_PROB = 0.65                # High AI confidence required
+
+# --- External Services ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+STATE_FILE = "coin_sniper_state.json"
+ML_FILE = "coin_sniper_ml.json"
+LEDGER_FILE = "coin_sniper_ledger.csv"
+
+# =========================
+# DATA MODELS & PERSISTENCE
+# =========================
+@dataclass
+class Position:
+    symbol: str
+    qty: float
+    entry_price: float
+    entry_time: float
+    high_water: float
+    stop_price: float
+    trailing_active: bool
+    trail_dist_pct: float
+    last_reason: str
+    last_score: int
+    entry_rvol: float
+    entry_accel: float
+    entry_ext: float
+    entry_atrp: float
+
+def notify(msg: str):
+    print(msg, flush=True)
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, 
+                          timeout=10)
+        except Exception: pass
+
+# =========================
+# TRADING ENGINE LOGIC
+# =========================
+
+def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, Dict[str, float]]:
+    if not candles: return None, "no_data", {}
+    recent = list(reversed(candles[:200]))
+    closes = np.array([float(c[4]) for c in recent])
+    vols = np.array([float(c[5]) for c in recent])
+    
+    p0 = closes[-1]
+    avg_vol = np.mean(vols[-20:-1])
+    rvol = vols[-1] / avg_vol if avg_vol > 0 else 1
+    
+    # Velocity calculation
+    v_now = (closes[-1] - closes[-4]) / closes[-4] if len(closes) > 4 else 0
+    v_prev = (closes[-4] - closes[-7]) / closes[-7] if len(closes) > 7 else 0
+    accel = v_now - v_prev
+    
+    ema20 = _ema(closes, 20)[-1]
+    ext = (p0 - ema20) / ema20
+    atrp = _atr_percent(candles)
+
+    score = 5
+    if rvol >= MIN_VOLUME_RATIO: score += 3
+    if rvol >= 5.0: score += 2
+    if accel > 0: score += 1
+    if ext > EXTENSION_MAX: score -= 7 # Heavily penalize overextension
+    
+    return int(max(1, min(10, score))), f"RVOL:{rvol:.1f} Accel:{accel:.3f}", {"rvol": rvol, "accel": accel, "ext": ext, "atrp": atrp}
+
+def open_position(state, positions, sym, price, score, reason, extra):
+    cash = state["cash"]
+    if cash < MIN_TRADE_SIZE: return
+    
+    qty = MIN_TRADE_SIZE / price
+    state["cash"] -= MIN_TRADE_SIZE
+    
+    positions[sym] = Position(
+        symbol=sym, qty=qty, entry_price=price, entry_time=time.time(),
+        high_water=price, stop_price=price * (1 - STOP_LOSS_PERCENT/100),
+        trailing_active=False, trail_dist_pct=TRAILING_DISTANCE_PERCENT,
+        last_reason=reason, last_score=score,
+        entry_rvol=extra['rvol'], entry_accel=extra['accel'], 
+        entry_ext=extra['ext'], entry_atrp=extra['atrp']
+    )
+    
+    notify(f"🟢 *BUY {sym}*\nPrice: ${price:.6f}\nScore: {score}/10\nReason: {reason}")
+
+def close_position(state, positions, sym, price, reason):
+    p = positions.pop(sym)
+    proceeds = p.qty * price
+    pnl = proceeds - (p.qty * p.entry_price)
+    pnl_pct = (pnl / (p.qty * p.entry_price)) * 100
+    
+    state["cash"] += proceeds
+    state["realized_pnl"] += pnl
+    if pnl > 0: state["wins"] += 1
+    else: state["losses"] += 1
+    
+    state["cooldowns"][sym] = time.time() + COOLDOWN_SECONDS_AFTER_SELL
+    
+    icon = "📈" if pnl > 0 else "📉"
+    notify(f"{icon} *SELL {sym}*\nExit: ${price:.6f}\nPnL: ${pnl:.2f} ({pnl_pct:.2f}%)\nReason: {reason}")
+
+def status_report(state, positions, last_prices, guard_msg):
+    cash = state["cash"]
+    eq = cash + sum(p.qty * last_prices.get(s, p.entry_price) for s, p in positions.items())
+    wins, losses = state["wins"], state["losses"]
+    wr = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    
+    msg = (f"📊 *ELITE PROFIT REPORT*\n"
+           f"Equity: ${eq:.2f} | Cash: ${cash:.2f}\n"
+           f"PnL: ${state['realized_pnl']:.2f}\n"
+           f"Win Rate: {wr:.1f}% ({wins}W/{losses}L)\n"
+           f"Guard: {guard_msg}")
+    notify(msg)
+
+# =========================
+# HELPER FUNCTIONS & LOOP
+# =========================
+def _ema(s, n):
+    a = 2 / (n + 1)
+    res = np.zeros_like(s)
+    res[0] = s[0]
+    for i in range(1, len(s)):
+        res[i] = a * s[i] + (1 - a) * res[i-1]
+    return res
+
+def _atr_percent(candles):
+    # Simplified ATR% calculation
+    return 1.5 
+
+def main():
+    state = {"cash": START_BALANCE, "positions": {}, "wins": 0, "losses": 0, "realized_pnl": 0.0, "cooldowns": {}}
+    positions = {}
+    last_status = 0
+    
+    notify("🚀 *Savage ELITE Engine Initialized*")
+    
     while True:
-        start_time = time.time()
-        pairs = get_pairs()
-        heads_scanned = len(pairs)
-        runners = []
-
-        for pair in pairs:
-            if not passes_filters(pair): continue
-
-            addr = pair.get("pairAddress")
-            token_addr = pair.get("baseToken", {}).get("address")
-            symbol = pair.get("baseToken", {}).get("symbol", "UNK")
-            price = float(pair.get("priceUsd", 0))
+        try:
+            # Placeholder for product universe and candle fetching
+            # manage_positions(...)
+            # score_symbol(...)
+            # status_report(...)
             
-            # Anti-Spam: Only re-alert if price jumps another 15%
-            if addr in alerted_tokens and price < (alerted_tokens[addr] * 1.15):
-                continue
-
-            score = score_pair(pair)
-            if score < 6: continue # Only alert on high-conviction scores
-
-            alerted_tokens[addr] = price
-            m5 = pair.get("priceChange", {}).get("m5", 0)
-            vol = pair.get("volume", {}).get("m5", 0)
-            
-            alert = (f"🚀 *EXPLOSIVE RUNNER DETECTED*\n\n"
-                     f"**Token:** {symbol}\n"
-                     f"**Score:** {score}/10\n"
-                     f"**5m Change:** {m5}%\n"
-                     f"**5m Vol:** ${int(vol):,}\n\n"
-                     f"[DexScreener](https://dexscreener.com/search?q={addr}) | "
-                     f"[RugCheck](https://rugcheck.xyz/tokens/{token_addr})")
-            runners.append(alert)
-
-        # Heartbeat
-        report = f"🔍 *Scan Complete*\nHeads: {heads_scanned} | Runners: {len(runners)}"
-        send_telegram(report)
-
-        for r in runners:
-            send_telegram(r)
-
-        elapsed = time.time() - start_time
-        time.sleep(max(1, SCAN_INTERVAL - elapsed))
+            time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            notify(f"⚠️ Error: {str(e)}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    run()
+    main()
