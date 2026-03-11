@@ -1,13 +1,9 @@
 # Coin Sniper — Savage ELITE (PAPER) — EXPLOSIVE OPTIMIZED (FULL RUNNING FILE)
-# ✅ RVOL spike detection (primary trigger)
-# ✅ Momentum acceleration / velocity
-# ✅ Extension filter (avoid god-candle tops)
-# ✅ ATR-based adaptive trailing distance
-# ✅ BTC market guard (blocks NEW buys during sharp drops)
-# ✅ Micro-cap targeting (Market Cap ≤ $50M & Price ≤ $0.50)
-# ✅ Paper trading: ledger CSV + stats (wins/losses/win%) + equity/cash/open trades
-# ✅ ML training + auto-activation after enough trades + Telegram notification
-# ✅ Optional GitHub persistence (save/load state + ML data)
+# ✅ Wins/Losses/Win% Tracking + Realized PnL
+# ✅ Exact Status Report Formatting (W/L, Equity, Position List)
+# ✅ Micro-cap targeting (Price ≤ $0.50 + Vol Filter)
+# ✅ BTC market guard + ATR-based adaptive trailing
+# ✅ ML training + Telegram notification
 #
 # NOTE: PAPER trading only. No real orders placed.
 
@@ -63,7 +59,7 @@ MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", "35"))
 
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "4.0"))
 TRAILING_START_PERCENT = float(os.getenv("TRAILING_START_PERCENT", "0.8"))
-TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "1.0"))
+TRAILING_DISTANCE_PERCENT = float(os.getenv("TRAILING_DISTANCE_PERCENT", "2.50"))
 
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MULT = float(os.getenv("ATR_MULT", "2.0"))
@@ -73,13 +69,13 @@ MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "2.0"))
 EXTENSION_MAX = float(os.getenv("EXTENSION_MAX", "0.06"))
 
 COOLDOWN_SECONDS_AFTER_SELL = int(os.getenv("COOLDOWN_SECONDS_AFTER_SELL", "900"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "150")) # Increased to find more micro-caps
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "150"))
 
 # Micro-cap constraints
 MICROCAP_MAX_PRICE = 0.50  
-MICROCAP_THRESHOLD = float(os.getenv("MICROCAP_THRESHOLD", "50000000")) # $50M Max Cap
+MICROCAP_THRESHOLD = float(os.getenv("MICROCAP_THRESHOLD", "50000000")) 
 
-COINS = os.getenv("COINS", "").strip()
+COINS = os.getenv("COINS", "AUTO").strip()
 EXCLUDE = set([s.strip() for s in os.getenv("EXCLUDE", "").split(",") if s.strip()])
 
 CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", "60"))
@@ -92,18 +88,11 @@ BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTC-USD")
 
 ML_ENABLED = os.getenv("ML_ENABLED", "1") == "1"
 ML_MIN_TRADES = int(os.getenv("ML_MIN_TRADES", "25"))
-ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", "0.55"))
-ML_FEATURE_VERSION = 1
+ML_MIN_PROB = float(os.getenv("ML_MIN_PROB", "0.62"))
 
 STATE_FILE = os.getenv("STATE_FILE", "coin_sniper_state.json")
 ML_FILE = os.getenv("ML_FILE", "coin_sniper_ml.json")
 LEDGER_FILE = os.getenv("LEDGER_FILE", "coin_sniper_ledger.csv")
-
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_STATE_PATH = os.getenv("GITHUB_STATE_PATH", STATE_FILE)
-GITHUB_ML_PATH = os.getenv("GITHUB_ML_PATH", ML_FILE)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -136,14 +125,9 @@ def _http_get(url: str, params: Optional[dict] = None) -> Any:
     r.raise_for_status()
     return r.json()
 
-def get_market_cap(product_id: str) -> float:
-    """Estimates market cap based on 24h volume and price as a proxy for liquidity/size 
-    if full supply data is unavailable. For accurate micro-cap targeting on Coinbase, 
-    we filter by 'stats' data."""
+def get_market_cap_proxy(product_id: str) -> float:
     try:
         data = _http_get(f"{COINBASE_API}/products/{product_id}/stats")
-        # Coinbase doesn't always provide circulating supply via public API.
-        # We use 'volume' as a secondary micro-cap filter: real micro-caps usually have lower 24h vol.
         return float(data.get("volume", 0)) * float(data.get("last", 0))
     except:
         return 0.0
@@ -165,10 +149,13 @@ def list_usd_products() -> List[str]:
 
 def get_candles(product_id: str, granularity: int, limit_points: int) -> List[list]:
     params = {"granularity": granularity}
-    data = _http_get(f"{COINBASE_API}/products/{product_id}/candles", params=params)
-    if not isinstance(data, list) or len(data) == 0:
+    try:
+        data = _http_get(f"{COINBASE_API}/products/{product_id}/candles", params=params)
+        if not isinstance(data, list) or len(data) == 0:
+            return []
+        return data[:limit_points]
+    except:
         return []
-    return data[:limit_points]
 
 def get_last_price_from_candles(candles: List[list]) -> Optional[float]:
     try:
@@ -240,14 +227,13 @@ def score_symbol(sym: str, candles: List[list]) -> Tuple[Optional[int], str, Dic
 
     p0 = closes[-1]
 
-    # Target Micro-caps only
+    # Skip if price > MICROCAP_MAX_PRICE
     if p0 > MICROCAP_MAX_PRICE:
         return None, f"price_above_microcap({MICROCAP_MAX_PRICE})", {}
-    
-    # Optional: Filter out heavy volume assets to ensure we stay in the "Savage Elite" micro-cap zone
-    mcap_proxy = get_market_cap(sym)
-    if mcap_proxy > MICROCAP_THRESHOLD:
-        return None, "exceeds_microcap_volume_threshold", {}
+
+    # Skip if volume proxy is too high (not a micro-cap)
+    if get_market_cap_proxy(sym) > MICROCAP_THRESHOLD:
+         return None, "exceeds_mcap_threshold", {}
 
     avg_vol = float(np.mean(vols[-21:-1])) if len(vols) >= 22 else float(np.mean(vols[:-1]))
     rvol = (vols[-1] / avg_vol) if avg_vol > 0 else 1.0
@@ -306,10 +292,18 @@ class Position:
     entry_atrp: float
 
 # =========================
-# HELPER WRAPPERS (State/Logic)
+# STATE & LEDGER
 # =========================
 def default_state():
-    return {"cash": START_BALANCE, "positions": {}, "last_status_ts": 0, "last_ml_ts": 0}
+    return {
+        "cash": START_BALANCE, 
+        "realized_pnl": 0.0, 
+        "wins": 0, 
+        "losses": 0, 
+        "positions": {}, 
+        "last_status_ts": 0, 
+        "last_ml_ts": 0
+    }
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -346,7 +340,6 @@ def log_trade(symbol, side, price, qty, reason, pnl=0, pnl_pct=0):
         writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), symbol, side, price, qty, reason, pnl, pnl_pct])
 
 def can_buy_symbol(state, sym):
-    # check cooldown from ledger
     if not os.path.exists(LEDGER_FILE): return True
     now = time.time()
     try:
@@ -363,7 +356,7 @@ def can_buy_symbol(state, sym):
     return True
 
 # =========================
-# ML STUB (Simplified for flow)
+# ML PERSISTENCE
 # =========================
 def load_ml_store():
     if os.path.exists(ML_FILE):
@@ -420,7 +413,7 @@ def open_position(state, positions, sym, px, score, reason, extra):
     )
     positions[sym] = pos
     log_trade(sym, "BUY", px, qty, reason)
-    notify(f"🚀 BUY {sym} @ {px:.4f} (Score:{score})")
+    notify(f"🚀 BUY {sym} @ {px:.6f} (Score:{score})")
 
 def close_position(state, positions, sym, px, reason):
     pos = positions.pop(sym)
@@ -428,8 +421,15 @@ def close_position(state, positions, sym, px, reason):
     pnl_pct = (px / pos.entry_price - 1) * 100
     state["cash"] = float(state["cash"]) + (pos.qty * px)
     
+    # Track stats
+    state["realized_pnl"] = float(state.get("realized_pnl", 0.0)) + pnl
+    if pnl > 0:
+        state["wins"] = int(state.get("wins", 0)) + 1
+    else:
+        state["losses"] = int(state.get("losses", 0)) + 1
+
     log_trade(sym, "SELL", px, pos.qty, reason, pnl, pnl_pct)
-    notify(f"💰 SELL {sym} @ {px:.4f} | PnL: {pnl:.2f} ({pnl_pct:.2f}%) | {reason}")
+    notify(f"💰 SELL {sym} @ {px:.6f} | PnL: {pnl:.2f} ({pnl_pct:.2f}%) | {reason}")
     
     # Save to ML store
     ml_s = load_ml_store()
@@ -461,53 +461,71 @@ def btc_guard_ok() -> Tuple[bool, str]:
     if not BTC_GUARD_ENABLED: return True, "Disabled"
     try:
         c = get_candles(BTC_SYMBOL, 60, BTC_GUARD_WINDOW_MIN + 1)
-        if len(c) < BTC_GUARD_WINDOW_MIN: return True, "Insuff. BTC data"
+        if not c or len(c) < BTC_GUARD_WINDOW_MIN: return True, "Insuff. BTC data"
         p_now = float(c[0][4])
         p_old = float(c[-1][4])
         drop = (p_now / p_old - 1) * 100
         if drop <= -BTC_GUARD_DROP_PCT:
-            return False, f"BTC Drop {drop:.2f}%"
-        return True, f"BTC {drop:+.2f}%"
-    except: return True, "Error check"
+            return False, f"BTC Drop {drop:.2f}%/15m"
+        return True, f"BTC_GUARD ok drop={drop:.2f}%/15m"
+    except: return True, "Guard Error"
 
 def status_report(state, positions, last_prices, guard_msg, ml_active):
-    total_val = float(state["cash"])
+    cash = float(state["cash"])
+    wins = int(state.get("wins", 0))
+    losses = int(state.get("losses", 0))
+    realized = float(state.get("realized_pnl", 0.0))
+    
+    total_trades = wins + losses
+    win_pct = (wins / total_trades * 100) if total_trades > 0 else 0.0
+    
+    equity = cash
+    pos_lines = []
     for sym, pos in positions.items():
         px = last_prices.get(sym, pos.entry_price)
-        total_val += (px * pos.qty)
-    p_count = len(positions)
-    print(f"[{time.strftime('%H:%M:%S')}] Equity: {total_val:.2f} | Cash: {state['cash']:.2f} | Pos: {p_count} | BTC: {guard_msg} | ML: {ml_active}")
+        equity += (px * pos.qty)
+        pnl_p = (px / pos.entry_price - 1) * 100
+        trail_status = "Y" if pos.trailing_active else "N"
+        pos_lines.append(f" - {sym}: qty={pos.qty:.6f} entry={pos.entry_price:.6f} now={px:.6f} pnl%={pnl_p:.2f} high={pos.high_water:.6f} trail={trail_status} dist={pos.trail_dist_pct:.2f}%")
+
+    report = (
+        f"📊 Coin Sniper PAPER [{INSTANCE_ID}]\n"
+        f"Cash: ${cash:.2f} | Equity: ${equity:.2f} | Realized PnL: ${realized:.2f}\n"
+        f"W/L: {wins}/{losses} | Win%: {win_pct:.1f}% | Open trades: {len(positions)}/{MAX_OPEN_TRADES}\n"
+        f"Guard: {guard_msg}\n"
+        f"ML: {'ON' if ml_active else 'OFF'} (min_trades={ML_MIN_TRADES}, min_prob={ML_MIN_PROB})\n"
+        f"Open positions:\n" + ("\n".join(pos_lines) if pos_lines else "None")
+    )
+    notify(report)
 
 # =========================
 # MAIN LOOP
 # =========================
 def main():
-    notify(f"[{INSTANCE_ID}] Coin Sniper MICRO-CAP LIVE. scan={SCAN_INTERVAL}s")
+    notify(f"[{INSTANCE_ID}] Coin Sniper PAPER is LIVE. scan={SCAN_INTERVAL}s")
 
     state = load_state()
     positions = positions_from_state(state)
     ensure_ledger_header()
 
     ml_store = load_ml_store()
-    model = None
+    model = train_model(ml_store)
 
-    coins_clean = (COINS or "").strip()
-    if (not coins_clean) or (coins_clean.upper() == "AUTO"):
+    if (COINS or "").upper() == "AUTO":
         universe = list_usd_products()
     else:
-        universe = [s.strip() for s in coins_clean.split(",") if s.strip()]
+        universe = [s.strip() for s in COINS.split(",") if s.strip()]
 
-    universe = [s for s in universe if s not in EXCLUDE]
-    
-    last_status = 0
-    last_ml = 0
+    universe = [s for s in universe if s not in EXCLUDE][:MAX_SYMBOLS]
+
+    last_status = float(state.get("last_status_ts", 0))
+    last_ml = float(state.get("last_ml_ts", 0))
 
     while True:
         try:
             guard_ok, guard_msg = btc_guard_ok()
             last_prices: Dict[str, float] = {}
             
-            # Update existing positions
             for sym in list(positions.keys()):
                 candles = get_candles(sym, CANDLE_GRANULARITY, 5)
                 px = get_last_price_from_candles(candles)
@@ -517,7 +535,6 @@ def main():
             state["positions"] = positions_to_state(positions)
             save_state(state)
 
-            new_buys = 0
             if guard_ok and len(positions) < MAX_OPEN_TRADES:
                 candidates = []
                 for sym in universe:
@@ -526,11 +543,8 @@ def main():
 
                     candles = get_candles(sym, CANDLE_GRANULARITY, CANDLE_POINTS)
                     px = get_last_price_from_candles(candles)
+                    if px is None: continue
                     
-                    # Target Micro-caps only
-                    if px is None or px > MICROCAP_MAX_PRICE:
-                        continue
-                        
                     score, reason, extra = score_symbol(sym, candles)
                     if score is None or int(score) < ENTRY_SCORE_MIN:
                         continue
@@ -543,6 +557,7 @@ def main():
 
                 candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
+                new_buys = 0
                 for sc, rv, sym, px, reason, extra, prob in candidates:
                     if new_buys >= MAX_NEW_BUYS_PER_SCAN or len(positions) >= MAX_OPEN_TRADES: break
                     if float(state["cash"]) < MIN_TRADE_SIZE: break
@@ -557,15 +572,18 @@ def main():
                 ml_store = load_ml_store()
                 model = train_model(ml_store)
                 last_ml = now
-            
+                state["last_ml_ts"] = int(last_ml)
+
             if (now - last_status) >= STATUS_INTERVAL:
-                status_report(state, positions, last_prices, guard_msg, ml_store.get("ml_active"))
+                status_report(state, positions, last_prices, guard_msg, ml_store.get("ml_active", False))
                 last_status = now
+                state["last_status_ts"] = int(last_status)
+                save_state(state)
 
             time.sleep(SCAN_INTERVAL)
 
         except Exception as e:
-            print(f"Error: {e}")
+            notify(f"⚠️ ERROR: {e}\n{traceback.format_exc()}")
             time.sleep(10)
 
 if __name__ == "__main__":
